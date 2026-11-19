@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+import { Readable } from 'node:stream'
 import {
   type AppPluginServer,
   appPluginRequest,
@@ -634,7 +636,8 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
     const id = nextId++
     const reply = await postJsonRpc(url, headers, { jsonrpc: '2.0', id, method, params }, signal)
     if (method === 'initialize' && reply.sessionId) headers['mcp-session-id'] = reply.sessionId
-    const record = asRecord(jsonRpcReply(reply, id))
+    const record = asRecord(reply.message)
+    if (!isReplyTo(record, id)) throw new Error(`HTTP MCP server sent no reply for request ${id}`)
     if (record.error) throw new Error(JSON.stringify(record.error))
     return record.result
   }
@@ -654,16 +657,37 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
 
 // One JSON-RPC message posted to an HTTP server, and what came back. Errors
 // leave out what fetch says, which can repeat the url or a header value.
+// An event stream is read up to the event that answers `id`, not to its end:
+// the server may keep it open.
 async function postJsonRpc(
   url: string,
   headers: Record<string, string>,
-  message: Record<string, unknown>,
+  message: { jsonrpc: string; id?: number; method: string; params: unknown },
   signal: AbortSignal,
-): Promise<{ text: string; stream: boolean; sessionId: string | null }> {
+): Promise<{ message: unknown; sessionId: string | null }> {
+  const id = message.id
   let response: Response
   let text: string
   try {
     response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(message), signal })
+    if (
+      response.ok &&
+      response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
+    ) {
+      const sessionId = response.headers.get('mcp-session-id')
+      if (id === undefined || !response.body) {
+        await response.body?.cancel()
+        return { message: null, sessionId }
+      }
+      const stream = Readable.fromWeb(response.body)
+      const lines = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY })
+      try {
+        return { message: await eventReply(lines, id), sessionId }
+      } finally {
+        lines.close()
+        stream.destroy()
+      }
+    }
     text = await response.text()
   } catch (error) {
     if (signal.aborted) throw new Error('MCP request timed out')
@@ -677,33 +701,48 @@ async function postJsonRpc(
     throw new OutOfReach(`HTTP MCP request failed ${response.status}: ${detail}`)
   }
   if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${detail}`)
-  return {
-    text,
-    stream: (response.headers.get('content-type') ?? '').includes('text/event-stream'),
-    sessionId: response.headers.get('mcp-session-id'),
-  }
+  const trimmed = text.trim()
+  const record =
+    id === undefined
+      ? null
+      : /^(event|data|id):/.test(trimmed)
+        ? await eventReply(trimmed.split(/\r\n|\r|\n/), id)
+        : JSON.parse(trimmed)
+  return { message: record, sessionId: response.headers.get('mcp-session-id') }
 }
 
-// The reply to request id: the JSON body, or, from an event stream, the
-// event that answers it, which notifications can come before.
-function jsonRpcReply(reply: { text: string; stream: boolean }, id: number): unknown {
-  const trimmed = reply.text.trim()
-  if (!reply.stream && !/^(event|data|id):/.test(trimmed)) return JSON.parse(trimmed)
-  let last: unknown = null
-  for (const event of trimmed.split(/\r?\n\r?\n/)) {
-    const data = event
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice('data:'.length).trim())
-      .join('\n')
-    if (!data) continue
-    const message = asRecord(JSON.parse(data))
-    if (typeof message.method === 'string') continue
-    if (String(message.id) === String(id)) return message
-    if ('result' in message || 'error' in message) last = message
+// A message can span multiple data lines and network reads. Consume complete
+// frames as they arrive, retaining only the current event.
+async function* eventData(lines: AsyncIterable<string> | Iterable<string>): AsyncGenerator<string> {
+  let data: string[] = []
+  for await (const line of lines) {
+    if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+    else if (!line && data.length) {
+      yield data.join('\n')
+      data = []
+    }
   }
-  if (last == null) throw new Error('HTTP MCP server sent no reply')
-  return last
+  if (data.length) yield data.join('\n')
+}
+
+async function eventReply(
+  lines: AsyncIterable<string> | Iterable<string>,
+  id: number,
+): Promise<unknown> {
+  for await (const data of eventData(lines)) {
+    if (!data.trim()) continue
+    const message = asRecord(JSON.parse(data))
+    if (isReplyTo(message, id)) return message
+  }
+  return null
+}
+
+function isReplyTo(message: Record<string, unknown>, id: number): boolean {
+  return (
+    typeof message.method !== 'string' &&
+    (message.id === id || message.id === String(id)) &&
+    ('result' in message || 'error' in message)
+  )
 }
 
 // What a stdio server wrote to stderr, to go with an error.
