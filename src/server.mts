@@ -9868,21 +9868,26 @@ export class CodexClaudeAppServer {
   }
 
   private getConversationSummary(params: Record<string, unknown>): unknown {
+    // The v1 request matches rolloutPath first when a client sends both
+    // selectors. Adapter threads are indexed by id and have no rollout path.
+    if (typeof params.rolloutPath === 'string') throw unknownThread(params.rolloutPath)
     const threadId = stringOr(params.conversationId, '')
-    const thread = this.store.getThread(threadId) ?? this.store.listThreads({ limit: 1 }).at(0)
-    const now = new Date().toISOString()
+    if (!threadId)
+      throw invalidRequest('getConversationSummary requires a conversationId or rolloutPath')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw unknownThread(threadId)
     return {
       summary: {
-        conversationId: thread?.id ?? threadId,
+        conversationId: thread.id,
         path: '',
-        preview: thread?.preview ?? '',
-        timestamp: now,
-        updatedAt: now,
-        modelProvider: thread?.modelProvider ?? 'claude-code',
-        cwd: thread?.cwd ?? process.cwd(),
+        preview: thread.preview,
+        timestamp: new Date(thread.createdAt * 1000).toISOString(),
+        updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
+        modelProvider: thread.modelProvider,
+        cwd: thread.cwd,
         cliVersion: codexCliVersion(),
-        source: normalizeSessionSource(thread?.source),
-        gitInfo: thread?.gitInfo
+        source: normalizeSessionSource(thread.source),
+        gitInfo: thread.gitInfo
           ? {
               sha: thread.gitInfo.sha,
               branch: thread.gitInfo.branch,
