@@ -1,5 +1,7 @@
 # Claude Codex Adapter
 
+[简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml)
 [![Docs](https://github.com/nwverse/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://nwverse.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
@@ -31,6 +33,14 @@ tooltip shows 160 (−6.4%). It uses the same synthetic data as the screenshot.
 </details>
 
 📖 **Documentation: <https://nwverse.github.io/claude-codex/>**
+
+## Community video tour
+
+Boulea7's tour shows a Claude chat, leader tools, and an inline chart. Leader
+tools require `CLAUDE_CODEX_LEADER_TOOLS=1`. Chart rendering requires a Codex
+App version with visualization support. This is an independent community demo.
+
+[Watch the English tour (MP4)](https://github.com/Boulea7/claude-codex/releases/download/promo-v1/claude-codex-en.mp4) · [English subtitles (SRT)](https://github.com/Boulea7/claude-codex/releases/download/promo-v1/claude-codex-en.srt)
 
 ## Quick start
 
