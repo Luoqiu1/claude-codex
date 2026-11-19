@@ -1,9 +1,19 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  accessSync,
+  constants,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
+import { isDeepStrictEqual, promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
@@ -36,7 +46,7 @@ import {
   reportedClaudeModel,
 } from './claude-models.mjs'
 import { configRequirements } from './cli-probes.mjs'
-import { codexAutoCompactLimit } from './codex-config.mjs'
+import { asTable, codexAutoCompactLimit } from './codex-config.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import { parseCommandActions } from './command-actions.mjs'
 import { appendCommandOutput } from './command-output.mjs'
@@ -846,7 +856,16 @@ export class CodexClaudeAppServer {
       toolItem: (event, cwd, options) => this.toolUseToItem(event, cwd, options),
       reasoningVisible: () => reasoningSummariesVisible(this.configOverrides),
     })
-    this.loadPersistedConfig()
+    // Startup also drops legacy overrides, including private desktop MCP
+    // settings. Keep the server available if the settings file is unreadable.
+    try {
+      this.loadPersistedConfig('startup')
+    } catch (error) {
+      debugLog('config.load.failed', {
+        path: this.configPath,
+        code: (error as NodeJS.ErrnoException).code,
+      })
+    }
     // A CLI reported a different set of commands: the App refetches
     // skills/list, which serves them as skills.
     // App rule: skills-popup
@@ -1278,9 +1297,9 @@ export class CodexClaudeAppServer {
       case 'plugin/share/delete':
         return {}
       case 'plugin/uninstall':
-        return this.pluginUninstall(asRecord(params))
+        return this.store.transaction(() => this.pluginUninstall(asRecord(params)))
       case 'plugin/install':
-        return this.pluginInstall(asRecord(params))
+        return this.store.transaction(() => this.pluginInstall(asRecord(params)))
       case 'skills/config/write':
         // App rule: settings-write-errors
         if (asRecord(params).enabled === false) {
@@ -1429,7 +1448,7 @@ export class CodexClaudeAppServer {
         return this.serverDiagnostics()
       case 'config/value/write':
       case 'config/batchWrite':
-        return this.configWriteResponse(asRecord(params))
+        return this.store.transaction(() => this.configWriteResponse(asRecord(params)))
       case 'getConversationSummary':
         return this.getConversationSummary(asRecord(params))
       case 'gitDiffToRemote':
@@ -1463,6 +1482,9 @@ export class CodexClaudeAppServer {
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // Another adapter can tighten the defaults between starts. Read them
+    // before creating a worktree or thread, even if this peer skips config/read.
+    this.loadPersistedConfig('thread')
     // Specs Codex would reject fail the request, as they do there. With the
     // switch off they are ignored.
     // App rule: dynamic-tools
@@ -8462,6 +8484,7 @@ export class CodexClaudeAppServer {
   }
 
   private configRead(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
     // layered on top so the user sees their last-saved values instead of
@@ -9501,6 +9524,8 @@ export class CodexClaudeAppServer {
   // or, when one fails, none: the App shows the error and its settings stay
   // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
+    const edits: Record<string, unknown> = {}
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
     let effort = this.configReasoningEffort
@@ -9508,8 +9533,10 @@ export class CodexClaudeAppServer {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
         model = normalizeSelectableModelId(value, model)
+        edits.model = model
       } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
         effort = normalizeCodexReasoningEffort(value) ?? effort
+        edits.model_reasoning_effort = effort
       } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
         editMcpServers(overrides, edit)
       } else {
@@ -9525,10 +9552,11 @@ export class CodexClaudeAppServer {
         }
       }
     }
+    if (!isDeepStrictEqual(overrides, this.configOverrides)) edits.overrides = overrides
+    this.persistConfig(saved, edits)
     this.configOverrides = overrides
     this.configModel = model
     this.configReasoningEffort = effort
-    this.persistConfig()
     const filePath = stringOr(params.filePath, `${codexHome()}/config.toml`)
     return {
       status: 'ok',
@@ -9589,31 +9617,39 @@ export class CodexClaudeAppServer {
   // started before the App gets to it list the same skills.
   // App rule: inline-visualizations
   private pluginInstall(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
     const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
     const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
-    let changed = false
+    const edits: Record<string, unknown> = {}
+    let appPlugins = this.appPlugins
+    let installedAppPlugins = this.installedAppPlugins
     if (plugin && known?.root !== plugin.root) {
-      this.appPlugins = [...this.appPlugins.filter((candidate) => candidate !== known), plugin]
-      changed = true
+      appPlugins = [...appPlugins.filter((candidate) => candidate !== known), plugin]
+      edits.appPlugins = appPlugins
     }
     // App rule: code-review-plugin-server
     const installed = appMarketplacePlugin(params.marketplacePath, params.pluginName)
     if (installed?.marketplace) {
       const id = `${installed.name}@${installed.marketplace}`
-      const was = this.installedAppPlugins.find((candidate) => candidate.id === id)
+      const was = installedAppPlugins.find((candidate) => candidate.id === id)
       if (was?.root !== installed.root) {
-        this.installedAppPlugins = [
-          ...this.installedAppPlugins.filter((candidate) => candidate !== was),
+        installedAppPlugins = [
+          ...installedAppPlugins.filter((candidate) => candidate !== was),
           { id, root: installed.root },
         ]
-        changed = true
+        edits.installedAppPlugins = installedAppPlugins
       }
     }
-    if (changed) this.persistConfig()
+    if (appPlugins !== this.appPlugins || installedAppPlugins !== this.installedAppPlugins) {
+      this.persistConfig(saved, edits)
+      this.appPlugins = appPlugins
+      this.installedAppPlugins = installedAppPlugins
+    }
     return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
   }
 
   private pluginUninstall(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
     // Plugin ids read `<name>@<marketplace>`.
     const id = stringOr(params.pluginId, '')
     const name = id.split('@')[0]
@@ -9623,9 +9659,9 @@ export class CodexClaudeAppServer {
       kept.length !== this.appPlugins.length ||
       installed.length !== this.installedAppPlugins.length
     ) {
+      this.persistConfig(saved, { appPlugins: kept, installedAppPlugins: installed })
       this.appPlugins = kept
       this.installedAppPlugins = installed
-      this.persistConfig()
     }
     return {}
   }
@@ -10661,67 +10697,106 @@ export class CodexClaudeAppServer {
     for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
-  private loadPersistedConfig(): void {
-    try {
-      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as Record<string, unknown>
-      let shouldRepair = false
-      if (typeof parsed.model === 'string' && parsed.model.length > 0) {
-        const normalized = normalizeSelectableModelId(parsed.model, this.configModel)
-        shouldRepair = normalized !== parsed.model
-        this.configModel = normalized
-      }
-      if (typeof parsed.model_reasoning_effort === 'string') {
-        this.configReasoningEffort =
-          normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
-      }
-      // Restore the overrides bag — any key persisted previously that isn't
-      // the strongly-typed model / effort lives here so it survives restarts.
-      if (
-        parsed.overrides &&
-        typeof parsed.overrides === 'object' &&
-        !Array.isArray(parsed.overrides)
-      ) {
-        this.configOverrides = parsed.overrides as Record<string, unknown>
-        if (pruneLegacySettings(this.configOverrides)) shouldRepair = true
-      }
-      if (Array.isArray(parsed.appPlugins)) {
-        this.appPlugins = parsed.appPlugins.flatMap((entry) => {
+  private loadPersistedConfig(
+    purpose: 'read' | 'startup' | 'thread' = 'read',
+  ): Record<string, unknown> | null {
+    // Read first. A transient I/O error must leave the last good in-memory
+    // settings intact, and prevent a writer from replacing the unread file.
+    const saved = this.savedConfig(purpose === 'thread')
+    const parsed = saved ?? {}
+    const fallback = defaultSelectableModelId()
+    this.configModel =
+      typeof parsed.model === 'string'
+        ? normalizeSelectableModelId(parsed.model, fallback)
+        : fallback
+    this.configReasoningEffort =
+      normalizeCodexReasoningEffort(stringOr(parsed.model_reasoning_effort, '')) ??
+      normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ??
+      'medium'
+    this.configOverrides = { ...asTable(parsed.overrides) }
+    const pruned = pruneLegacySettings(this.configOverrides)
+    this.appPlugins = Array.isArray(parsed.appPlugins)
+      ? parsed.appPlugins.flatMap((entry) => {
           const plugin = asRecord(entry)
           return typeof plugin.name === 'string' && typeof plugin.root === 'string'
             ? [{ name: plugin.name, root: plugin.root }]
             : []
         })
-      }
-      if (Array.isArray(parsed.installedAppPlugins)) {
-        this.installedAppPlugins = parsed.installedAppPlugins.flatMap((entry) => {
+      : []
+    this.installedAppPlugins = Array.isArray(parsed.installedAppPlugins)
+      ? parsed.installedAppPlugins.flatMap((entry) => {
           const plugin = asRecord(entry)
           return typeof plugin.id === 'string' && typeof plugin.root === 'string'
             ? [{ id: plugin.id, root: plugin.root }]
             : []
         })
-      }
-      if (shouldRepair) this.persistConfig()
-    } catch {}
+      : []
+    // A model missing from this adapter's picker can be valid for a different
+    // adapter. Keep its on-disk selection until an explicit model edit.
+    if (purpose === 'startup' && pruned) {
+      // A clean startup only reads. Recheck inside the writer lock before
+      // migrating, in case another process saved since the initial read.
+      this.store.transaction(() => {
+        const current = this.loadPersistedConfig()
+        if (asTable(current?.overrides))
+          this.persistConfig(current, { overrides: this.configOverrides })
+      })
+    }
+    return saved
   }
 
-  private persistConfig(): void {
+  private savedConfig(forThreadStart: boolean): Record<string, unknown> | null {
     try {
-      ensureParent(this.configPath)
-      writeFileSync(
-        this.configPath,
-        JSON.stringify(
-          {
-            model: this.configModel,
-            model_reasoning_effort: this.configReasoningEffort,
-            overrides: this.configOverrides,
-            appPlugins: this.appPlugins,
-            installedAppPlugins: this.installedAppPlugins,
-          },
-          null,
-          2,
-        ) + '\n',
-        { mode: 0o600 },
-      )
-    } catch {}
+      const parsed = asTable(JSON.parse(readFileSync(this.configPath, 'utf8')))
+      if (parsed || !forThreadStart) return parsed
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if (!(error instanceof SyntaxError)) throw error
+      if (!forThreadStart) return null
+    }
+    // A settings edit can repair malformed JSON. Starting a new thread
+    // without its saved permission defaults must wait for that repair.
+    throw new Error(
+      `Cannot start a thread because ${this.configPath} must contain a valid JSON object.`,
+    )
+  }
+
+  private persistConfig(
+    saved: Record<string, unknown> | null,
+    edits: Record<string, unknown>,
+  ): void {
+    // Initialize missing or malformed files in the established format. On a
+    // valid file, preserve every key outside this request's edits.
+    const config = {
+      ...(saved ?? {
+        model: this.configModel,
+        model_reasoning_effort: this.configReasoningEffort,
+        overrides: this.configOverrides,
+        appPlugins: this.appPlugins,
+        installedAppPlugins: this.installedAppPlugins,
+      }),
+      ...edits,
+    }
+    if (isDeepStrictEqual(config, saved)) return
+    // Rename next to the target so a linked config stays linked, including
+    // when a user creates the link before the first save.
+    let target = this.configPath
+    const links = new Set<string>()
+    while (lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      if (links.has(target)) throw new Error(`symbolic link loop at ${target}`)
+      links.add(target)
+      target = resolve(dirname(target), readlinkSync(target))
+    }
+    // Renaming can replace a read-only file in a writable directory. Honor
+    // the file permissions that a direct config write would enforce.
+    if (existsSync(target)) accessSync(target, constants.W_OK)
+    const temp = `${target}.${newId()}.tmp`
+    try {
+      ensureParent(target)
+      writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
+      renameSync(temp, target)
+    } finally {
+      rmSync(temp, { force: true })
+    }
   }
 }
