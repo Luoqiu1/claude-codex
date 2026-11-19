@@ -76,6 +76,7 @@ import {
   asInvalidRequest,
   hostMethod,
   INVALID_REQUEST,
+  invalidParams,
   invalidRequest,
   invalidRequestIfThrows,
   methodNotFound,
@@ -119,6 +120,7 @@ import {
   sessionApproval,
   sessionSuggestionsEnabled,
 } from './permission-suggestions.mjs'
+import { signalProcessGroup, stopProcessGroup } from './process-group.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -229,6 +231,7 @@ import {
 import {
   findOccurrences,
   forkTurns,
+  historyItems,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -299,6 +302,7 @@ import type {
   UserInputQuestion,
   WireMessage,
 } from './types.mjs'
+import { startUserShell, type UserShellRun } from './user-shell.mjs'
 import {
   adapterHome,
   CLAUDE_CODE_AGENT_EFFORT_VERSION,
@@ -533,33 +537,6 @@ function threadIdList(value: unknown): string[] {
 // and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
 const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
 const COMMAND_EXEC_IO_DRAIN_MS = 2_000
-// How long a stopped command has to exit on SIGTERM before it gets SIGKILL.
-const COMMAND_EXEC_KILL_GRACE_MS = 1_000
-
-// Signals a child's process group when it leads one (spawned detached),
-// else the child alone.
-function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid && process.platform !== 'win32') {
-    try {
-      process.kill(-child.pid, signal)
-      return
-    } catch {
-      // Not a group leader, or the group is gone: fall back to the child.
-    }
-  }
-  try {
-    child.kill(signal)
-  } catch {
-    // Already gone.
-  }
-}
-
-// SIGTERM to the group, then SIGKILL to whatever ignores it.
-function stopProcessGroup(child: ChildProcess): void {
-  signalProcessGroup(child, 'SIGTERM')
-  const kill = setTimeout(() => signalProcessGroup(child, 'SIGKILL'), COMMAND_EXEC_KILL_GRACE_MS)
-  kill.unref()
-}
 
 // The pty bridge's own stop takes up to about 1.2 s: SIGTERM to its shell's
 // group, SIGKILL after 0.2 s, then at most 1 s draining the last output.
@@ -754,6 +731,7 @@ export class CodexClaudeAppServer {
   // Approvals the user gave "for this session", by thread: a command, a
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
   private sessionApprovals = new Map<string, Set<string>>()
+  private userShells = new Map<string, { standalone: boolean; runs: Map<string, UserShellRun> }>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
   // The connection that started each command/exec and process/spawn process:
@@ -940,6 +918,7 @@ export class CodexClaudeAppServer {
     this.idleSleep.stop()
     this.leaderThreads.stop()
     try {
+      for (const turnId of this.userShells.keys()) this.stopUserShells(turnId, 'server stopped')
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
       // runtime or closing SQLite, otherwise stdio EOF can leave child turns
@@ -2429,7 +2408,7 @@ export class CodexClaudeAppServer {
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
-      data: turn?.items ?? [],
+      data: turn ? historyItems(turn) : [],
       nextCursor: null,
       backwardsCursor: null,
     }
@@ -3441,49 +3420,143 @@ export class CodexClaudeAppServer {
         continue
       await this.stopBackgroundSubagent(entry)
     }
+    // Archiving or deleting a parent takes its child threads with it. A child
+    // can have opened a user shell of its own since the subagent task ended.
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      const turnId = this.activeTurnByThread.get(id)
+      if (!turnId) continue
+      if (this.userShells.get(turnId)?.standalone) this.settleInterruptedTurn(peer, id, turnId)
+      else this.stopUserShells(turnId, 'command aborted by user')
+    }
   }
 
-  private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
+  private async threadShellCommand(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
     const command = stringOr(params.command, '')
-    if (!command) return {}
-    const shell = process.env.SHELL || '/bin/sh'
-    const cwd = thread?.cwd ?? process.cwd()
-    const processId = newId()
-    debugLog('thread.shellCommand.start', { threadId, processId, cwd, command })
-    const child = spawn(shell, ['-lc', command], { cwd, env: process.env, stdio: 'pipe' })
-    this.commandProcesses.set(processId, child)
-    child.stdout?.on('data', (chunk) =>
+    const timeoutMs = params.timeoutMs ?? 3_600_000
+    if (typeof timeoutMs === 'number' && timeoutMs < 0) {
+      throw invalidParams(`thread/shellCommand timeoutMs must be non-negative, got ${timeoutMs}`)
+    }
+    if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs)) {
+      throw invalidParams('thread/shellCommand timeoutMs must be a non-negative safe integer')
+    }
+    if (!command.trim()) throw invalidParams('command must not be empty')
+    if (command.includes('\0')) throw invalidParams('command must not contain NUL')
+    // A racing turn/start may still be claiming this thread across an await.
+    while (this.startingTurnByThread.has(threadId)) await this.startingTurnByThread.get(threadId)
+    if (this.stopped) throw invalidRequest('server stopped')
+    const thread = this.startableThread(threadId)
+    if (thread.archived) throw invalidRequest('cannot run a shell command in an archived thread')
+    this.subscribe(threadId, peer)
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    const turnId = activeTurnId ?? newId()
+    const group = this.userShells.get(turnId) ?? {
+      standalone: !activeTurnId,
+      runs: new Map<string, UserShellRun>(),
+    }
+    const item: Extract<ThreadItem, { type: 'commandExecution' }> = {
+      type: 'commandExecution',
+      id: newId(),
+      command,
+      cwd: thread.cwd,
+      processId: null,
+      source: 'userShell',
+      status: 'inProgress',
+      commandActions: [{ type: 'unknown', command }],
+      aggregatedOutput: null,
+      exitCode: null,
+      durationMs: null,
+    }
+    if (!activeTurnId) {
+      const turn: TurnRecord = {
+        id: turnId,
+        threadId,
+        status: 'inProgress',
+        startedAt: nowSeconds(),
+        completedAt: null,
+        durationMs: null,
+        items: [item],
+        diff: '',
+        error: null,
+      }
+      this.store.upsertTurn(turn)
+      this.activeTurnByThread.set(threadId, turnId)
+      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
       this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stdout',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.stderr?.on('data', (chunk) =>
-      this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stderr',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.once('error', (error) =>
-      debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }),
-    )
-    child.once('close', (code, signal) => {
-      debugLog('thread.shellCommand.close', { threadId, processId, code, signal })
-      this.commandProcesses.delete(processId)
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+    } else {
+      this.store.appendItem(turnId, item)
+    }
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: nowMillis() },
     })
+    debugLog('thread.shellCommand.start', { threadId, turnId, itemId: item.id, cwd: thread.cwd })
+    const run = startUserShell(
+      thread.cwd,
+      command,
+      timeoutMs,
+      (delta) => {
+        if (!this.stopped)
+          this.notify(peer, {
+            method: 'item/commandExecution/outputDelta',
+            params: { threadId, turnId, itemId: item.id, delta },
+          })
+      },
+      (result) => {
+        group.runs.delete(item.id)
+        if (!group.runs.size) this.userShells.delete(turnId)
+        const current = this.store.getTurn(turnId)
+        if (current?.status !== 'inProgress') return
+        const { exitCode, aggregatedOutput, durationMs } = result
+        const completedItem: ThreadItem = {
+          ...item,
+          status: exitCode === 0 ? 'completed' : 'failed',
+          exitCode,
+          aggregatedOutput,
+          durationMs,
+        }
+        this.store.updateItem(turnId, item.id, () => completedItem)
+        debugLog('thread.shellCommand.close', {
+          threadId,
+          turnId,
+          itemId: item.id,
+          exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs,
+        })
+        if (this.stopped) return
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId, turnId, item: completedItem, completedAtMs: nowMillis() },
+        })
+        if (group.standalone && !group.runs.size && !result.aborted) {
+          const completed = this.endTurn(current, 'completed', null)
+          if (completed) {
+            this.clearActiveTurn(threadId, turnId)
+            this.setThreadStatus(peer, threadId, { type: 'idle' })
+            this.notify(peer, {
+              method: 'turn/completed',
+              params: { threadId, turn: this.toLifecycleTurn(completed) },
+            })
+          }
+        }
+      },
+    )
+    group.runs.set(item.id, run)
+    this.userShells.set(turnId, group)
     return {}
+  }
+
+  // A turn closes its live shell items before it announces its terminal state.
+  private stopUserShells(turnId: string, message: string): void {
+    for (const run of this.userShells.get(turnId)?.runs.values() ?? []) run.stop(message)
   }
 
   // Codex's "clean background terminals" ends the shells a thread left
@@ -4170,6 +4243,10 @@ export class CodexClaudeAppServer {
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     let thread = this.startableThread(threadId)
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    if (activeTurnId && this.userShells.get(activeTurnId)?.standalone) {
+      throw invalidRequest('cannot start a turn while a user shell command is running')
+    }
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -6537,7 +6614,16 @@ export class CodexClaudeAppServer {
     const currentTurn = this.store.getTurn(turn.id)
     if (currentTurn && currentTurn.status !== 'inProgress') return
 
-    const finalDiff = await gitDiff(thread.cwd)
+    let finalDiff = await gitDiff(thread.cwd)
+    // A joined shell can outlast the model and make further file changes.
+    // Finish its item and refresh the diff before closing the turn.
+    let shells = this.userShells.get(turn.id)
+    while (shells) {
+      await Promise.all(Array.from(shells.runs.values(), (run) => run.done))
+      if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
+      finalDiff = await gitDiff(thread.cwd)
+      shells = this.userShells.get(turn.id)
+    }
     if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
@@ -8305,6 +8391,15 @@ export class CodexClaudeAppServer {
     // Subagent threads are stored too, so this check covers them.
     if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
+    const shellTurnId = this.activeTurnByThread.get(threadId)
+    if (
+      shellTurnId &&
+      this.userShells.get(shellTurnId)?.standalone &&
+      (!requestedTurnId || shellTurnId === requestedTurnId)
+    ) {
+      this.settleInterruptedTurn(peer, threadId, shellTurnId)
+      return {}
+    }
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
     if (background?.running) {
@@ -8336,7 +8431,9 @@ export class CodexClaudeAppServer {
   private settleInterruptedTurn(peer: RpcPeer, threadId: string, turnId: string): void {
     if (turnId) {
       const turn = this.store.getTurn(turnId)
+      if (turn && turn.threadId !== threadId) return
       if (turn?.status === 'inProgress') {
+        this.stopUserShells(turnId, 'command aborted by user')
         // Claude may still be streaming a message (a turn held open for its
         // workflow always is); the App needs it completed before the turn.
         this.closeStreamingItemsByTurn.get(turnId)?.()
@@ -8388,6 +8485,8 @@ export class CodexClaudeAppServer {
     // refusal is Codex's invalid-request error with the turn kind in
     // `data`, which App builds that queue a message sent during a compaction
     // match on.
+    if (this.userShells.get(activeTurnId)?.standalone)
+      throw invalidRequest('cannot steer a user shell command')
     const turnKind = this.unsteerableTurns.get(activeTurnId)
     if (turnKind) {
       const message = `cannot steer a ${turnKind} turn`
@@ -10044,7 +10143,7 @@ export class CodexClaudeAppServer {
     return {
       id: turn.id,
       rootTurnId: turn.rootTurnId ?? turn.id,
-      items: turn.items,
+      items: historyItems(turn),
       itemsView: 'full',
       status: turn.status,
       error: turn.error,
@@ -10604,6 +10703,7 @@ export class CodexClaudeAppServer {
   // and the terminal record built in memory when the store refused the write;
   // that write is then retried in the background.
   private endTurn(turn: TurnRecord, status: TurnStatus, error: unknown | null): TurnRecord | null {
+    this.stopUserShells(turn.id, 'command stopped because its turn ended')
     try {
       const current = this.store.getTurn(turn.id)
       if (current && current.status !== 'inProgress') return null
