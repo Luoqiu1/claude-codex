@@ -890,6 +890,25 @@ versioning or publishing metadata.
   declines any tool beyond its reads instead of approving it. `never` with
   any other sandbox still runs every tool unasked: the adapter has no OS
   sandbox to confine workspace-write.
+- Approval policy `on-failure` runs Claude Code in `acceptEdits` mode only in
+  a `workspace-write` sandbox; anywhere else file edits ask. In a read-only
+  sandbox, edits in the workspace used to run with no card. (#331)
+- An approval card that a turn ending on its own takes down, such as a
+  background agent's request still open when Claude finishes its reply, now
+  declines the call, and Claude is told the turn had ended rather than that
+  the user declined. It used to reach Claude Code as the user's Cancel, which
+  stopped the background agent. Stop, or Cancel on a card (also while the
+  turn is still finishing), still stops the call. (#331)
+- `turn/start`, `thread/settings/update` and `thread/resume` that name a
+  custom permissions profile with explicit approval and sandbox fields now
+  store those fields as the thread's policy, as `thread/start` does. The turn
+  used to run on them while approvals and later turns kept the thread's
+  earlier policy, so a Full Access thread moved to a custom read-only profile
+  still ran every call without a card. (#331)
+- The `claude-p` backend pre-approves only Read, Grep, Glob, LS and WebSearch
+  in a read-only thread, as the Agent SDK route runs there. It also
+  pre-approved WebFetch, Task and TodoWrite, so a read-only chat could fetch
+  any URL with no card. (#331)
 
 ### Trustworthy history and settings
 
