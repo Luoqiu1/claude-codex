@@ -1,8 +1,10 @@
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
   lstatSync,
+  openSync,
   readlinkSync,
   renameSync,
   rmSync,
@@ -22,6 +24,35 @@ export function jsonFileTarget(path: string): string {
     target = resolve(dirname(target), readlinkSync(target))
   }
   return target
+}
+
+// Runs a read/modify/replace of the JSON file at `path` holding a lock next
+// to the file it resolves to, `<file>.lock.sqlite` (owner-only, holds no
+// data), so writers in every home linked to that file take turns. `body`
+// gets the resolved target. A folder this process cannot write takes none of
+// its writes either, so the lock is skipped there (a read-only dotfiles
+// folder, say): an unchanged save still succeeds and a change still fails on
+// the file.
+export function withJsonFileLock<T>(path: string, body: (target: string) => T): T {
+  const target = jsonFileTarget(path)
+  const lockPath = `${target}.lock.sqlite`
+  try {
+    ensureParent(target)
+    closeSync(openSync(lockPath, 'a', 0o600))
+  } catch (error) {
+    if (!['EACCES', 'EPERM', 'EROFS'].includes((error as NodeJS.ErrnoException).code ?? ''))
+      throw error
+    return body(target)
+  }
+  // Loading SQLite lazily keeps CLI probes independent of the lock.
+  const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite')
+  const lock = new DatabaseSync(lockPath, { timeout: 5000 })
+  try {
+    lock.exec('BEGIN IMMEDIATE')
+    return body(target)
+  } finally {
+    lock.close()
+  }
 }
 
 export function replaceJsonFile(target: string, value: unknown): void {

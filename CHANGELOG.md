@@ -17,6 +17,28 @@ versioning or publishing metadata.
 - A native Codex chat keeps its active sidebar state when another adapter opens
   the same state directory. A later startup clears the activity marker if the
   adapter that ran the native turn has exited.
+- With native mode on, `thread/resume` ignores a picker model on another
+  backend or Codex provider and opens the chat on its own model, as it does
+  without native mode. Opening a Claude chat, or a native chat of the other
+  provider, while the composer was on another harness's model used to fail
+  with "cannot change runtime backend … start a new thread". (#337)
+- Adapters sharing a state directory no longer run a native Codex chat at the
+  same time. While one adapter's turn or change runs, another refuses
+  `turn/start`, shell commands, reviews, compaction, rollback, revert, item
+  injection, goal changes, steer, interrupt, archive and delete with "has an
+  active turn in another adapter process", as for Claude chats. Two `codex
+  app-server` children used to run or rewrite the same rollout at once. The
+  claim ends with the turn, the request, the adapter or its Codex child; a
+  turn Codex accepted but never announced holds it for
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most, and one announced after that,
+  while another adapter's turn runs, is stopped and leaves that claim alone.
+  Continuing one native chat from two adapters in turn is still unsupported:
+  each adapter's Codex child keeps the conversation it loaded and does not see
+  turns the other one added later. (#337)
+- With native mode on, an existing `codex exec` chat, and a fork the adapter
+  makes itself, refuse a Codex+AsterGate model ("start a new thread"); a
+  resume ignores one. Such a chat used to accept the model and then fail every
+  turn, because `codex exec` ran the prefixed id on its default provider. (#337)
 - A native `codex app-server` child that exits on its own (a crash) now takes
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
@@ -946,6 +968,14 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- Settings saves from adapters whose `config.json` is a link to one shared
+  file all stay. Each save is now locked next to the file the link points to,
+  in an empty owner-only `config.json.lock.sqlite`, as the shared Claude model
+  and command catalogs are; adapters with different state directories used to
+  overwrite each other's simultaneous saves while reporting each one as saved.
+  A link into a folder the adapter cannot write (read-only dotfiles) takes no
+  lock: unchanged saves succeed and changes fail on the file, as before.
+  (#337)
 - A turn no longer stores the whole uncommitted `git diff` of its folder,
   which nothing read back. In a repository with a large uncommitted change
   every turn added megabytes to `state.sqlite`, every fork copied them, and

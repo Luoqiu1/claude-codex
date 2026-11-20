@@ -1389,28 +1389,81 @@ export class SessionStore {
       .run(preview, threadId)
   }
 
-  startNativeTurnActivity(threadId: string): void {
-    const owner = currentProcessOwner()
+  // A native thread's owner marker is also its claim, as claimTurn's row is
+  // for an adapter-managed turn: one adapter's codex child at a time runs or
+  // rewrites the rollout. A live owner in another adapter keeps it; a dead
+  // one's is taken over.
+  claimNativeTurn(threadId: string): boolean {
+    const before = this.foreignNativeOwner(threadId)
+    // ps can take seconds, so read liveness before taking the write lock. An
+    // owner that claimed meanwhile is a live one.
+    const alive = before !== null && otherProcessRunning(before)
+    return this.transaction(() => {
+      const owner = this.foreignNativeOwner(threadId)
+      if (owner && (alive || owner.pid !== before?.pid || owner.started !== before.started))
+        return false
+      const self = currentProcessOwner()
+      this.db
+        .prepare(`UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?
+        WHERE id = ?`)
+        .run(self.pid, self.started, threadId)
+      // The turn of an owner that exited ended with it.
+      if (owner)
+        this.db
+          .prepare(`UPDATE threads SET status_json = ?, updated_at = ?
+          WHERE id = ? AND json_extract(status_json, '$.type') = 'active'`)
+          .run(JSON.stringify({ type: 'idle' }), nowSeconds(), threadId)
+      return true
+    })
+  }
+
+  // Gives up this adapter's claim when no turn took it over.
+  releaseNativeTurn(threadId: string): void {
+    const self = currentProcessOwner()
+    this.db
+      .prepare(`UPDATE threads SET native_active_owner_pid = NULL, native_active_owner_started = NULL
+      WHERE id = ? AND native_active_owner_pid = ? AND native_active_owner_started IS ?`)
+      .run(threadId, self.pid, self.started)
+  }
+
+  // Another live adapter runs the native thread's turn.
+  hasForeignNativeTurn(threadId: string): boolean {
+    const owner = this.foreignNativeOwner(threadId)
+    return owner !== null && otherProcessRunning(owner)
+  }
+
+  private foreignNativeOwner(threadId: string): { pid: number; started: string | null } | null {
+    const row = this.db
+      .prepare(`SELECT native_active_owner_pid AS pid, native_active_owner_started AS started
+      FROM threads WHERE id = ?`)
+      .get(threadId) as { pid: number | null; started: string | null } | undefined
+    if (row?.pid == null) return null
+    const self = currentProcessOwner()
+    if (row.pid === self.pid && row.started === self.started) return null
+    return { pid: Number(row.pid), started: row.started }
+  }
+
+  // Whether this adapter holds the claim for the turn. A turn Codex announces
+  // late can find another adapter's turn running on the claim it took
+  // meanwhile; that one keeps the claim and the status.
+  startNativeTurnActivity(threadId: string): boolean {
+    if (!this.claimNativeTurn(threadId)) return false
     // An earlier status event may already carry waitingOnApproval or other flags.
     this.db
       .prepare(`
-      UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?,
-        status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
+      UPDATE threads SET status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
                            THEN status_json ELSE ? END, updated_at = ?
       WHERE id = ?`)
-      .run(
-        owner.pid,
-        owner.started,
-        JSON.stringify({ type: 'active', activeFlags: [] }),
-        nowSeconds(),
-        threadId,
-      )
+      .run(JSON.stringify({ type: 'active', activeFlags: [] }), nowSeconds(), threadId)
+    return true
   }
 
-  updateNativeThreadStatus(threadId: string, status: ThreadStatus): void {
+  // A status other than active ends this adapter's claim, unless it still
+  // holds it for a request or turn of its own.
+  updateNativeThreadStatus(threadId: string, status: ThreadStatus, keepClaim = false): void {
     const owner = currentProcessOwner()
     const release =
-      status.type === 'active'
+      status.type === 'active' || keepClaim
         ? ''
         : ', native_active_owner_pid = NULL, native_active_owner_started = NULL'
     this.db

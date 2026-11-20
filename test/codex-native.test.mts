@@ -78,10 +78,12 @@ class Reader {
   }
 }
 
-function startAdapter(options: { home?: string; env?: NodeJS.ProcessEnv; args?: string[] } = {}) {
+function startAdapter(
+  options: { home?: string; env?: NodeJS.ProcessEnv; args?: string[]; log?: string } = {},
+) {
   const home = options.home ?? mkdtempSync(join(tmpdir(), 'codex-native-'))
   if (!options.home) dirs.push(home)
-  const log = join(home, 'fake.log')
+  const log = options.log ?? join(home, 'fake.log')
   const proc = spawn(
     process.execPath,
     [adapter, 'app-server', '--listen', 'stdio://', ...(options.args ?? [])],
@@ -90,7 +92,7 @@ function startAdapter(options: { home?: string; env?: NodeJS.ProcessEnv; args?: 
       env: {
         PATH: process.env.PATH,
         SYSTEMROOT: process.env.SYSTEMROOT,
-        ...nativeCodexTestEnv(home),
+        ...nativeCodexTestEnv(home, log),
         ...options.env,
       },
     },
@@ -615,4 +617,334 @@ test('adapter shutdown waits for a native child that ignores SIGTERM', async () 
     await app.stop()
   }
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
+})
+
+test('a resume ignores a model on another backend or provider, as without native mode', async () => {
+  const picks = [
+    { model: 'gpt-6.1-sol' },
+    { collaborationMode: { mode: 'default', settings: { model: 'gpt-6.1-sol' } } },
+  ]
+  for (const native of ['on', 'off']) {
+    const app = startAdapter({ env: { CLAUDE_CODEX_NATIVE_CODEX: native } })
+    try {
+      const threadId = await startChat(app, 'sonnet')
+      await app.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello' }] })
+      await app.reader.until((message) => message.method === 'turn/completed')
+      for (const pick of picks) {
+        const resumed = await app.request('thread/resume', { threadId, ...pick })
+        assert.equal(resumed.error, undefined, `${native}: ${JSON.stringify(resumed.error)}`)
+        assert.equal(resumed.result.model, 'sonnet')
+      }
+      assert.deepEqual(app.childLog(), [])
+    } finally {
+      await app.stop()
+    }
+  }
+  const app = startAdapter()
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'accept')
+    for (const pick of picks) {
+      const resumed = await app.request('thread/resume', { threadId, ...pick })
+      assert.equal(resumed.error, undefined, JSON.stringify(resumed.error))
+      assert.equal(resumed.result.model, 'codex-ag:claude-opus-5-5')
+    }
+    // The child hears the chat's own model, in the mode's settings too.
+    assert.deepEqual(
+      app
+        .childLog()
+        .filter((entry) => entry.method === 'thread/resume')
+        .map((entry) => [entry.params.model, entry.params.collaborationMode?.settings.model]),
+      [
+        ['claude-opus-5-5', undefined],
+        ['claude-opus-5-5', 'claude-opus-5-5'],
+      ],
+    )
+    const { seen } = await runTurn(app, threadId, 'accept')
+    const delta = seen.find((message) => message.method === 'item/agentMessage/delta')
+    assert.equal(delta.params.delta, 'astergate_claude:claude-opus-5-5:accept')
+  } finally {
+    await app.stop()
+  }
+})
+
+test('a second adapter refuses to run or rewrite a native chat while another one’s turn is live', async () => {
+  const first = startAdapter()
+  const apps = [first]
+  try {
+    const threadId = await startChat(first)
+    await runTurn(first, threadId, 'accept')
+    const hold = async (app: typeof first) => {
+      const started = await app.request('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: 'held' }],
+      })
+      assert.equal(started.error, undefined, JSON.stringify(started.error))
+      const approval = await app.reader.until((message) =>
+        message.method?.endsWith('requestApproval'),
+      )
+      return { turnId: started.result.turn.id as string, approval }
+    }
+    const held = await hold(first)
+    const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
+    apps.push(second)
+    await initialize(second)
+    const refused = [
+      ['turn/start', { threadId, input: [{ type: 'text', text: 'second' }] }],
+      ['thread/shellCommand', { threadId, command: 'ls' }],
+      ['review/start', { threadId, target: { type: 'uncommittedChanges' } }],
+      ['thread/compact/start', { threadId }],
+      ['thread/rollback', { threadId, numTurns: 1 }],
+      ['thread/inject_items', { threadId, items: [] }],
+      ['thread/goal/set', { threadId, objective: 'fixture' }],
+      ['turn/steer', { threadId, expectedTurnId: held.turnId, input: [] }],
+      ['turn/interrupt', { threadId, turnId: held.turnId }],
+      ['thread/archive', { threadId }],
+      ['thread/delete', { threadId }],
+    ] as const
+    for (const [method, params] of refused) {
+      const answer = await second.request(method, params)
+      assert.equal(answer.error?.code, -32600, method)
+      assert.match(answer.error.message, /active turn in another adapter process/, method)
+    }
+    // No second child started, and the running turn goes on.
+    assert.deepEqual(second.childLog(), [])
+    first.proc.stdin.write(
+      `${JSON.stringify({ id: held.approval.id, result: { decision: 'accept' } })}\n`,
+    )
+    await first.reader.until((message) => message.method === 'turn/completed')
+
+    // Once it ends, either adapter runs the next turn, one at a time.
+    await hold(second)
+    const blocked = await first.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'first' }],
+    })
+    assert.match(blocked.error?.message ?? '', /active turn in another adapter process/)
+    // An adapter that exited leaves the chat to the next one, idle even
+    // when what comes next is no turn.
+    const exited = once(second.proc, 'exit')
+    second.proc.kill('SIGKILL')
+    await exited
+    assert.deepEqual((await first.request('thread/rollback', { threadId, numTurns: 1 })).result, {})
+    const listed = await first.request('thread/list', {})
+    assert.deepEqual(listed.result.data.find((row: any) => row.id === threadId).status, {
+      type: 'idle',
+    })
+    await runTurn(first, threadId, 'decline')
+  } finally {
+    await Promise.all(apps.map((app) => app.stop()))
+  }
+})
+
+// The adapter that holds a native chat's claim, as the state database says.
+function nativeOwner(home: string, threadId: string): number | null {
+  const db = new DatabaseSync(join(home, 'adapter', 'state.sqlite'), { timeout: 5000 })
+  try {
+    const row = db
+      .prepare('SELECT native_active_owner_pid AS pid FROM threads WHERE id = ?')
+      .get(threadId) as { pid: number | null } | undefined
+    return row?.pid ?? null
+  } finally {
+    db.close()
+  }
+}
+
+// Polls with a deadline far beyond what a loaded machine needs.
+async function eventually(check: () => boolean, what: string): Promise<void> {
+  const end = Date.now() + 60_000
+  while (!check()) {
+    if (Date.now() > end) throw new Error(`${what} never happened`)
+    await delay(50)
+  }
+}
+
+// The fake child answers a shell command, review or compaction and never
+// announces its turn.
+const UNANNOUNCED = (threadId: string) =>
+  [
+    ['thread/shellCommand', { threadId, command: 'ls' }],
+    ['review/start', { threadId, target: { type: 'uncommittedChanges' } }],
+    ['thread/compact/start', { threadId }],
+  ] as const
+
+test('a native claim ends with its request, or a while after a turn Codex never announced', async () => {
+  // The wait is far longer than a request and the check after it take on a
+  // loaded machine, so each claim is still held when it is checked.
+  const app = startAdapter({
+    env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '5000', FAKE_REFUSE_CHANGES: '1' },
+  })
+  try {
+    const chat = async () => {
+      const id = await startChat(app)
+      await runTurn(app, id, 'accept')
+      return id
+    }
+    const threadId = await chat()
+    const owner = (id = threadId) => nativeOwner(app.home, id)
+    assert.equal(owner(), null)
+    // A rollback, or a request Codex refuses, holds it while it runs.
+    assert.deepEqual((await app.request('thread/rollback', { threadId, numTurns: 1 })).result, {})
+    assert.equal(owner(), null)
+    assert.match((await app.request('thread/archive', { threadId })).error.message, /unavailable/)
+    assert.equal(owner(), null)
+    // Each on a chat of its own, so no claim stands in for another.
+    const chats = [threadId, await chat(), await chat()]
+    const requests = chats.flatMap((id, i) => UNANNOUNCED(id).slice(i, i + 1))
+    for (const [method, params] of requests) {
+      assert.equal((await app.request(method, params)).error, undefined, method)
+      assert.equal(owner(params.threadId), app.proc.pid, method)
+    }
+    for (const [method, params] of requests)
+      await eventually(() => owner(params.threadId) === null, `${method} claim release`)
+    // A request that ends meanwhile leaves the claim to the one still waiting.
+    const overlapping = [
+      { id: 9001, method: 'thread/compact/start', params: { threadId } },
+      { id: 9002, method: 'thread/rollback', params: { threadId, numTurns: 1 } },
+    ]
+    app.proc.stdin.write(overlapping.map((message) => `${JSON.stringify(message)}\n`).join(''))
+    for (const { id } of overlapping) {
+      const answer = await app.reader.until((message) => message.id === id && !message.method)
+      assert.equal(answer.error, undefined)
+    }
+    assert.equal(owner(), app.proc.pid)
+    await eventually(() => owner() === null, 'compaction claim release')
+  } finally {
+    await app.stop()
+  }
+})
+
+test('a native claim for a turn Codex never announced ends with its child or adapter', async () => {
+  const app = startAdapter()
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'accept')
+    const owner = () => nativeOwner(app.home, threadId)
+    for (const [method, params] of UNANNOUNCED(threadId)) {
+      assert.equal((await app.request(method, params)).error, undefined, method)
+      assert.equal(owner(), app.proc.pid, method)
+      const child = app.childLog().findLast((entry) => entry.event === 'spawn').pid as number
+      process.kill(child, 'SIGKILL')
+      await eventually(() => owner() === null, `${method} claim release on exit`)
+    }
+    assert.equal((await app.request('thread/compact/start', { threadId })).error, undefined)
+    assert.equal(owner(), app.proc.pid)
+    await app.stop()
+    assert.equal(owner(), null)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('a native claim for a turn Codex never announced ends when the idle child stops', async () => {
+  // The idle stop comes far later than the probe right after the compaction
+  // can take on a loaded machine; the second adapter is up before it starts.
+  const first = startAdapter({ env: { CLAUDE_CODEX_NATIVE_IDLE_MS: '6000' } })
+  const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
+  try {
+    await initialize(second)
+    const threadId = await startChat(first)
+    await runTurn(first, threadId, 'accept')
+    const exits = () => first.childLog().filter((entry) => entry.event === 'exit').length
+    const before = exits()
+    assert.equal((await first.request('thread/compact/start', { threadId })).error, undefined)
+    const probe = () => second.request('thread/rollback', { threadId, numTurns: 1 })
+    assert.match((await probe()).error?.message ?? '', /active turn in another adapter process/)
+    await eventually(() => exits() > before, 'idle child stop')
+    await eventually(() => nativeOwner(first.home, threadId) === null, 'claim release')
+    assert.deepEqual((await probe()).result, {})
+  } finally {
+    await Promise.all([first.stop(), second.stop()])
+  }
+})
+
+test('a turn Codex announces late is stopped and leaves another adapter’s claim alone', async () => {
+  const first = startAdapter({
+    env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '500', FAKE_LATE_TURN: '1' },
+  })
+  const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
+  try {
+    await initialize(second)
+    const threadId = await startChat(first)
+    await runTurn(first, threadId, 'accept')
+    assert.equal((await first.request('thread/compact/start', { threadId })).error, undefined)
+    await eventually(() => nativeOwner(first.home, threadId) === null, 'claim release')
+    const started = await second.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'held' }],
+    })
+    assert.equal(started.error, undefined, JSON.stringify(started.error))
+    await second.reader.until((message) => message.method?.endsWith('requestApproval'))
+    // The first child now announces the compaction's turn; the first adapter
+    // stops it.
+    assert.equal((await first.request('thread/goal/get', { threadId })).error, undefined)
+    const ended = await first.reader.until(
+      (message) => message.method === 'turn/completed' && message.params.turn.id === 'turn-late',
+    )
+    assert.equal(ended.params.turn.status, 'interrupted')
+    assert.ok(
+      first
+        .childLog()
+        .some((entry) => entry.method === 'turn/interrupt' && entry.params.turnId === 'turn-late'),
+    )
+    assert.equal(nativeOwner(first.home, threadId), second.proc.pid)
+    const listed = await second.request('thread/list', {})
+    assert.deepEqual(listed.result.data.find((row: any) => row.id === threadId).status, {
+      type: 'active',
+      activeFlags: ['waitingOnApproval'],
+    })
+  } finally {
+    await Promise.all([first.stop(), second.stop()])
+  }
+})
+
+test('with native mode on, a chat on the exec route and a fork made here refuse Codex+AsterGate models', async () => {
+  const first = startAdapter()
+  const threadId = await startChat(first, 'gpt-6.1-sol')
+  try {
+    await runTurn(first, threadId, 'accept')
+  } finally {
+    await first.stop()
+  }
+  // A conversation from `codex exec`, as in a database from before native mode.
+  const db = new DatabaseSync(join(first.home, 'adapter', 'state.sqlite'))
+  try {
+    db.prepare('UPDATE threads SET native_codex_provider = NULL WHERE id = ?').run(threadId)
+  } finally {
+    db.close()
+  }
+  const ag = 'codex-ag:claude-opus-5-5'
+  for (const native of ['on', 'off']) {
+    const app = startAdapter({ home: first.home, env: { CLAUDE_CODEX_NATIVE_CODEX: native } })
+    try {
+      await initialize(app)
+      for (const method of ['thread/settings/update', 'thread/metadata/update']) {
+        const answer = await app.request(method, { threadId, model: ag })
+        // Without native mode the id is not a model, and the chat keeps its own.
+        if (native === 'off') assert.doesNotMatch(answer.error?.message ?? '', /AsterGate/)
+        else {
+          assert.equal(answer.error?.code, -32600, method)
+          assert.match(answer.error.message, /from Codex to Codex\+AsterGate/, method)
+        }
+      }
+      if (native === 'on') {
+        const turn = await app.request('turn/start', {
+          threadId,
+          model: ag,
+          input: [{ type: 'text', text: 'hello' }],
+        })
+        assert.equal(turn.error?.code, -32600)
+        const claude = await app.request('thread/start', { model: 'sonnet', cwd: app.home })
+        for (const parent of [threadId, claude.result.thread.id]) {
+          const fork = await app.request('thread/fork', { threadId: parent, model: ag })
+          assert.match(fork.error?.message ?? '', /cannot run on Codex\+AsterGate/)
+        }
+      }
+      const resumed = await app.request('thread/resume', { threadId, model: ag })
+      assert.equal(resumed.result.model, 'gpt-6.1-sol')
+      assert.deepEqual(app.childLog(), [])
+    } finally {
+      await app.stop()
+    }
+  }
 })

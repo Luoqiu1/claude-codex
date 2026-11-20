@@ -552,6 +552,65 @@ test('an atomic settings save preserves a symlink to the config file', {
   })
 })
 
+test('adapter homes whose config.json links to one file keep every simultaneous save', {
+  skip: process.platform === 'win32',
+}, async () => {
+  await withServer(async (a) => {
+    await a.request('config/value/write', { keyPath: 'model', value: 'opus' })
+    const file = join(a.home, 'claude-codex-adapter', 'config.json')
+    const b = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')))
+    try {
+      // Its home exists once it answers.
+      await b.request('config/read')
+      const link = join(b.home, 'claude-codex-adapter', 'config.json')
+      await symlink(file, link)
+      const keys = Array.from({ length: 40 }, (_, i) => `desktop.flag-${i}`)
+      await Promise.all(
+        keys.map((keyPath, i) =>
+          (i % 2 ? a : b).request('config/value/write', { keyPath, value: i }),
+        ),
+      )
+      const saved = JSON.parse(await readFile(file, 'utf8'))
+      assert.equal(saved.model, 'opus')
+      for (const [i, key] of keys.entries()) assert.equal(saved.overrides[key], i, key)
+      assert.equal((await lstat(link)).isSymbolicLink(), true)
+      // The lock beside it is the owner's alone.
+      assert.equal((await stat(`${file}.lock.sqlite`)).mode & 0o777, 0o600)
+    } finally {
+      await b.close()
+    }
+  })
+})
+
+test('a config.json linked into a read-only folder answers unchanged saves and refuses changes', {
+  skip: process.platform === 'win32' || process.getuid?.() === 0,
+}, async () => {
+  await withServer(async (server) => {
+    // Its home exists once it answers.
+    await server.request('config/read')
+    const dotfiles = join(server.home, 'dotfiles')
+    const target = join(dotfiles, 'claude-codex.json')
+    await mkdir(dotfiles)
+    await writeFile(target, JSON.stringify({ model: 'opus' }))
+    await symlink(target, join(server.home, 'claude-codex-adapter', 'config.json'))
+    await chmod(target, 0o444)
+    await chmod(dotfiles, 0o555)
+    try {
+      const unchanged = await server.request('config/value/write', {
+        keyPath: 'model',
+        value: 'opus',
+      })
+      assert.equal(unchanged.status, 'ok')
+      await assert.rejects(
+        server.request('config/value/write', { keyPath: 'model', value: 'sonnet' }),
+        (error: Error) => error.message.includes('EACCES') && error.message.includes(target),
+      )
+    } finally {
+      await chmod(dotfiles, 0o755)
+    }
+  })
+})
+
 test('thread history pages turns, items and the timeline', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
