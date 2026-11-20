@@ -1442,15 +1442,27 @@ versioning or publishing metadata.
   fixture drift gate.
 - The docs build no longer ignores dead links, so a link to a page that does not
   exist fails CI.
-- `npm test` passes in a developer's or Claude Code's shell as it does on CI:
-  `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
-  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters the
-  suites on `test/support/adapter-harness.mts` start no longer get the
-  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables, and no suite
-  writes to the real `~/.codex` debug log. Daemon and fixture tests allow for
-  a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
-  running, and a hung test fails after 2 minutes instead of holding
-  `npm test` (the CI job that runs it stops after 20 minutes).
+- `npm test` passes in a developer's or Claude Code's shell as it does on CI,
+  and leaves that shell's adapter and Claude state alone. It preloads
+  `dist/test/support/hermetic-env.mjs` into every suite, and the suites that
+  start adapters or run adapter code in-process import it too, for a direct
+  `node --test` run. No suite, and no adapter a suite starts, gets the
+  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables. Before, only the
+  `adapter-*` suites dropped them, and from a shell or chat that exports
+  `CLAUDE_CODEX_HOME` (as `claude-codex-isolated` does) the others wrote
+  dozens of mock threads, debug and run logs, and an
+  `approval_policy = never`, `danger-full-access` default into that live
+  adapter home. No suite writes to `~/.codex` either: a session store for a
+  database elsewhere no longer creates the adapter home, a thread's git
+  lookup that outlives its server no longer logs, and an MCP test no longer
+  reads `~/.codex/config.toml`. The relative `CLAUDE_CODEX_SOCKET_PATH` test
+  passes in a checkout deeper than about 84 bytes, and the
+  `app-server daemon version` test runs on macOS instead of skipping under
+  its long temp folder (#330). `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a
+  global `commit.gpgsign = true` no longer fail tests. Daemon and fixture
+  tests allow for a busy machine, `npm run build` clears `dist/test` so a
+  deleted suite stops running, and a hung test fails after 2 minutes instead
+  of holding `npm test` (the CI job that runs it stops after 20 minutes).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,
