@@ -4937,10 +4937,15 @@ export class CodexClaudeAppServer {
       resolvedModel,
       resolvedEffort,
     })
+    // A fork resumes the session it was forked from as a fork of it until a
+    // turn of its own has written to a session. Counting turns instead would
+    // resume the parent's session itself after a first turn that failed
+    // before Claude started. A fork whose own turns left no checkpoints (one
+    // from before checkpoints) forks its own session once more, then has one.
     const forkSession =
       thread.forkedFromId != null &&
       thread.claudeSessionId != null &&
-      this.store.listTurns(thread.id).length <= 1
+      !this.store.turnsWroteSession(thread.id, thread.claudeSessionId)
     // Set after a rewind or fork: this turn resumes the session only up to a
     // checkpoint. It stays pending until Claude starts the forked session.
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
