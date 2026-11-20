@@ -1078,6 +1078,43 @@ versioning or publishing metadata.
   listed Bash used to run in those threads with no card, a listed Write too
   in a read-only sandbox, and in plan mode a listed WebFetch ran instead of
   being refused. Other sandboxes keep the whole list. (#339)
+- With `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`, `permissions.ask` rules (and hook
+  `if` conditions) now cover calls the guard used to let through without a
+  prompt: a shell's `-c` script after its other options (`bash -c -e '…'`) or
+  behind a wrapper (`nohup sh -c 'cd app && git push'`); wrappers it did not
+  know, whichever of their options take a value (`setsid`, `flock`, `env -S`,
+  `watch`, `su -c`, `trap`, `sudo -EH -u root`, `env 'FOO=1'`, zsh's `noglob`,
+  `-` and `repeat`, `zargs`, and more); what `xargs` and `find -exec` add;
+  words the shell expands (`$'…'`, `$VAR` arguments, globs and brace lists,
+  also in a command name); on macOS, a command name in another case; zsh's
+  `=cmd` and its short `if` and `always` forms; a `Monitor` call's command;
+  file paths in another case, through `..` after a symlink, relative to the
+  session's current folder, or where a `Glob` pattern points; `*` in a tool
+  name or a `domain:`, and a `domain:` with a trailing dot, a port or a
+  non-ASCII name. A command line whose commands cannot be told apart is asked
+  about under any Bash rule: a shell or `source` reading stdin (also through
+  `/dev/stdin`), `parallel` or `script` with no command, an `alias`, a zsh
+  glob or extended pattern group anywhere (`ls *.(ts|js)`, `ls !(x)`: zsh's
+  `*(e:…:)` runs code), and text the shell runs later. That last one is
+  found by name wherever the line sets it (an assignment, `export`,
+  `printf -v`, `${…:=…}`), quoted or not, and a setter whose target name is
+  built when the line runs counts too: `PS4`, `BASH_ENV` on a line that starts a shell,
+  `ENV` on one that starts an interactive `sh`, `dash` or `ksh`, zsh's
+  function and alias tables, `glob_subst` and `zstyle -e`, an exported
+  `BASH_FUNC_`, `${(e)…}`, `$~x`, `${x@P}`, `mapfile -C`, and a declaration
+  that reads an expansion into an array. On a line that evaluates
+  arithmetic or names (`(( ))`, `$(( ))`, `let`, `${s:x}`, `a[x]=`, `${!x}`,
+  `read`, `printf -v` and the like), so is a subscript holding an expansion,
+  and an evaluated name filled from `read`, `printf -v`, the positional
+  parameters or text with `[`, `$` or an escape in it. A guard that cannot check a call (one with
+  thousands of options or a path of thousands of `x/../` parts) asks instead
+  of failing, which let the call through. `case` patterns, array elements,
+  `[[ … ]]` and `(( … ))` tests, array index loops, `[$TICKET]` or `[\x00-\x7F]` in a message or
+  a regular expression, `ENV=prod bash deploy.sh`, `timeout 5 grep rm`,
+  `command -v rm` and plain `$((…))` no longer ask under `Bash(rm:*)`, a
+  rule with several `*` no longer takes seconds to match a long command,
+  blocking the adapter meanwhile, and an `Agent(…)` rule covers a call with
+  no `subagent_type` only when it names `general-purpose`. (#346)
 
 ### Trustworthy history and settings
 
