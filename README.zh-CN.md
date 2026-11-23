@@ -407,9 +407,13 @@ npm run workflow -- status
 npm run workflow -- health
 npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
 npm run workflow -- schedule --worker codex-heartbeat
-npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
-npm run workflow -- complete --task task-id
+npm run workflow -- heartbeat --task task-id --worker codex-heartbeat --attempt 1
+npm run workflow -- complete --task task-id --worker codex-heartbeat --attempt 1
 ```
+
+`--worker` 和 `--attempt` 指明 `schedule` 输出的领取（`task.lease.workerId` 和
+`task.attempts`）。任务已被另一次领取接手时，`complete`、`fail` 和 `block` 会拒绝，
+以退出码 1 结束且不改动任务。
 
 周期性心跳在继续工作前应使用 `health`。健康循环没有过期租约、没有失败任务，并且
 没有运行中任务，或只有一个租约有效的运行中任务。租约仍有效时继续该任务，只有确实

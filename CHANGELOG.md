@@ -1614,6 +1614,14 @@ versioning or publishing metadata.
   first"` or an `--error` holding a diff, is refused with a hint to write
   `--name=value`, which keeps it as given. It used to be saved as `true`, as
   was a value option given last without a value. (#333)
+- `workflow complete`, `fail` and `block` take the claim `schedule` printed,
+  `--worker ID --attempt N` (`task.lease.workerId` and `task.attempts`), and
+  refuse a task that claim no longer holds with exit 1, leaving it unchanged;
+  `heartbeat` takes `--attempt` too. A worker whose lease expired and whose
+  task another claim took used to complete, requeue or block that newer
+  attempt and drop its lease with a late result, and `--worker` was ignored.
+  Without `--worker` the commands still apply to the running attempt, for
+  manual repair. (#371)
 
 ### Rust-first protocol groundwork
 

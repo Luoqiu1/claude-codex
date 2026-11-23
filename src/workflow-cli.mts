@@ -14,6 +14,7 @@ import {
   failWorkflowTask,
   renewWorkflowLease,
   scheduleNextWorkflowTask,
+  type WorkflowClaim,
 } from './workflow-scheduler.mjs'
 import { type WorkflowState, WorkflowStateStore, type WorkflowTask } from './workflow-state.mjs'
 
@@ -61,34 +62,40 @@ export async function runWorkflowCli(
     }
     case 'heartbeat': {
       const taskId = requiredOption(parsed, 'task')
+      const workerId = requiredOption(parsed, 'worker')
+      const attempt = claimOption(parsed)?.attempt
       await updateTask((state, now) =>
-        renewWorkflowLease(state, taskId, {
-          now,
-          workerId: requiredOption(parsed, 'worker'),
-          leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
-        }),
+        renewWorkflowLease(
+          state,
+          taskId,
+          { now, workerId, leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000 },
+          attempt,
+        ),
       )
       writeJson(io.stdout, { status: 'heartbeat', statePath: store.path, taskId })
       return 0
     }
     case 'complete': {
       const taskId = requiredOption(parsed, 'task')
-      await updateTask((state, now) => completeWorkflowTask(state, taskId, now))
+      const claim = claimOption(parsed)
+      await updateTask((state, now) => completeWorkflowTask(state, taskId, now, claim))
       writeJson(io.stdout, { status: 'completed', statePath: store.path, taskId })
       return 0
     }
     case 'fail': {
       const taskId = requiredOption(parsed, 'task')
+      const claim = claimOption(parsed)
       await updateTask((state, now) =>
-        failWorkflowTask(state, taskId, requiredOption(parsed, 'error'), now),
+        failWorkflowTask(state, taskId, requiredOption(parsed, 'error'), now, claim),
       )
       writeJson(io.stdout, { status: 'failed-or-requeued', statePath: store.path, taskId })
       return 0
     }
     case 'block': {
       const taskId = requiredOption(parsed, 'task')
+      const claim = claimOption(parsed)
       await updateTask((state, now) =>
-        blockWorkflowTask(state, taskId, requiredOption(parsed, 'reason'), now),
+        blockWorkflowTask(state, taskId, requiredOption(parsed, 'reason'), now, claim),
       )
       writeJson(io.stdout, { status: 'blocked', statePath: store.path, taskId })
       return 0
@@ -195,6 +202,7 @@ const VALUE_OPTIONS = new Set([
   'priority',
   'max-attempts',
   'worker',
+  'attempt',
   'ttl-ms',
   'task',
   'error',
@@ -235,6 +243,21 @@ function statePath(args: ParsedArgs): string {
   return resolve(stringOption(args, 'state') ?? join(adapterHome(), 'workflow-state.json'))
 }
 
+// --worker and --attempt name the claim a worker got from `schedule`
+// (lease.workerId and task.attempts). Without --worker there is no claim.
+function claimOption(args: ParsedArgs): WorkflowClaim | undefined {
+  const workerId = stringOption(args, 'worker')
+  const attempt = numberOption(args, 'attempt')
+  if (attempt !== null && (!Number.isInteger(attempt) || attempt < 1)) {
+    throw new WorkflowCliInputError('--attempt must be a positive integer')
+  }
+  if (!workerId) {
+    if (attempt !== null) throw new WorkflowCliInputError('--attempt needs --worker')
+    return undefined
+  }
+  return { workerId, attempt: attempt ?? undefined }
+}
+
 function requiredOption(args: ParsedArgs, name: string): string {
   const value = stringOption(args, name)
   if (value) return value
@@ -267,12 +290,18 @@ function writeHelp(output: Pick<NodeJS.WriteStream, 'write'>): void {
   workflow status [--state PATH]
   workflow enqueue --prompt TEXT [--id ID] [--priority N] [--max-attempts N] [--state PATH]
   workflow schedule [--worker ID] [--ttl-ms N] [--state PATH]
-  workflow heartbeat --task ID --worker ID [--ttl-ms N] [--state PATH]
+  workflow heartbeat --task ID --worker ID [--attempt N] [--ttl-ms N] [--state PATH]
   workflow health [--state PATH] [--run-log PATH]
   workflow ingest-github --github-json PATH [--state PATH]
-  workflow complete --task ID [--state PATH]
-  workflow fail --task ID --error TEXT [--state PATH]
-  workflow block --task ID --reason TEXT [--state PATH]
+  workflow complete --task ID [--worker ID [--attempt N]] [--state PATH]
+  workflow fail --task ID --error TEXT [--worker ID [--attempt N]] [--state PATH]
+  workflow block --task ID --reason TEXT [--worker ID [--attempt N]] [--state PATH]
+
+--worker and --attempt name the claim schedule printed (task.lease.workerId and
+task.attempts). complete, fail and block refuse a task that claim no longer
+holds and exit 1 without changing it; heartbeat leaves it alone. Without
+--worker, complete, fail and block apply to whichever attempt holds the task,
+for manual repair.
 
 A value that starts with "--" needs the --name=VALUE form.
 `)
