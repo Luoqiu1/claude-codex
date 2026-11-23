@@ -296,12 +296,22 @@ test('a hold the stored turns cannot give comes from the newest turn', async () 
 
 // A dispatch that passed the idle check, as startFollowUp's does, before a
 // turn of this process became active.
-const dispatchQueued = (app: InProcessApp, threadId: string, submission: unknown) => {
+const dispatchQueued = (
+  app: InProcessApp,
+  threadId: string,
+  submission: unknown,
+  named?: boolean,
+) => {
   const server = app.server as unknown as {
-    dispatchQueued(peer: unknown, threadId: string, submission: unknown): Promise<unknown>
+    dispatchQueued(
+      peer: unknown,
+      threadId: string,
+      submission: unknown,
+      named?: boolean,
+    ): Promise<unknown>
     peerForThread(threadId: string): unknown
   }
-  return server.dispatchQueued(server.peerForThread(threadId), threadId, submission)
+  return server.dispatchQueued(server.peerForThread(threadId), threadId, submission, named)
 }
 
 test('a queued message never joins a running turn, so it runs once, as its own turn', async () => {
@@ -369,5 +379,96 @@ test('a queued message edited while its turn starts runs as edited', async () =>
       false,
     )
     assert.deepEqual(app.store.listQueue(threadId), [])
+  })
+})
+
+// Two messages wait behind a turn the user interrupted.
+async function twoQueuedBehindAnInterrupt(app: InProcessApp, releases: Map<string, () => void>) {
+  const threadId = await app.startThread()
+  const turnId = await app.startTurn(threadId, '[hold] until the user stops this')
+  await app.waitFor(() => releases.get(turnId))
+  const first = (await app.request('thread/queue/add', { threadId, input: text('first queued') }))
+    .queuedSubmission
+  await app.request('thread/queue/add', { threadId, input: text('second queued') })
+  await app.request('turn/interrupt', { threadId, turnId })
+  await app.turnCompleted(turnId)
+  return { threadId, first }
+}
+
+const ran = (prompts: string[], message: string) =>
+  prompts.filter((prompt) => prompt.includes(message)).length
+
+test('a queued message deleted while its turn starts is skipped for the next one', async () => {
+  const { runtime, prompts, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const { threadId, first } = await twoQueuedBehindAnInterrupt(app, releases)
+    // The dispatch read the message before this delete landed.
+    const [stale] = app.store.listQueue(threadId)
+    assert.equal(stale?.id, first.id)
+    const { deleted } = await app.request('thread/queue/delete', {
+      threadId,
+      queuedSubmissionId: first.id,
+    })
+    assert.equal(deleted, true)
+    const errorsBefore = app.notified('error').length
+
+    await dispatchQueued(app, threadId, stale)
+    await app.waitFor(() => (ran(prompts, 'second queued') ? true : undefined))
+    await app.waitFor(() => (app.server.hasActiveTurns() ? undefined : true))
+    await delay(50)
+    assert.equal(ran(prompts, 'first queued'), 0)
+    assert.equal(ran(prompts, 'second queued'), 1)
+    assert.deepEqual(app.notified('error').slice(errorsBefore), [])
+    assert.deepEqual(app.store.listQueue(threadId), [])
+  })
+})
+
+test('a follow-up whose queued message is deleted before its claim runs the next one, without an error', async () => {
+  const { runtime, prompts, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const { threadId, first } = await twoQueuedBehindAnInterrupt(app, releases)
+    // The user resumed the queue.
+    queueHolds(app).set(threadId, false)
+    // The delete lands right after startFollowUp reads the head.
+    const store = app.store as unknown as { listQueue(id: string): unknown[] }
+    const listQueue = store.listQueue.bind(store)
+    let raced = false
+    store.listQueue = (id: string) => {
+      const items = listQueue(id)
+      if (!raced && id === threadId) {
+        raced = true
+        app.store.mutateQueue(threadId, (all) => all.filter((entry) => entry.id !== first.id))
+      }
+      return items
+    }
+    const errorsBefore = app.notified('error').length
+    const server = app.server as unknown as { startFollowUp(threadId: string): boolean }
+
+    assert.equal(server.startFollowUp(threadId), true)
+    await app.waitFor(() => (ran(prompts, 'second queued') ? true : undefined))
+    await app.waitFor(() => (app.server.hasActiveTurns() ? undefined : true))
+    await delay(50)
+    assert.equal(raced, true)
+    assert.equal(ran(prompts, 'first queued'), 0)
+    assert.equal(ran(prompts, 'second queued'), 1)
+    assert.deepEqual(app.notified('error').slice(errorsBefore), [])
+    assert.deepEqual(listQueue(threadId), [])
+  })
+})
+
+test('thread/queue/start of a message deleted while its turn starts runs nothing else', async () => {
+  const { runtime, prompts, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const { threadId, first } = await twoQueuedBehindAnInterrupt(app, releases)
+    const [stale] = app.store.listQueue(threadId)
+    await app.request('thread/queue/delete', { threadId, queuedSubmissionId: first.id })
+
+    await assert.rejects(
+      dispatchQueued(app, threadId, stale, true),
+      new RegExp(`unknown queued submission: ${first.id}`),
+    )
+    await delay(50)
+    assert.equal(ran(prompts, 'second queued'), 0)
+    assert.equal(app.store.listQueue(threadId).length, 1)
   })
 })

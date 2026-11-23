@@ -591,6 +591,9 @@ versioning or publishing metadata.
   exit 15 s after the App disconnects: a `!` shell command, review or
   compaction after the interrupt and another one after the restart no longer
   send the next queued message. (#351)
+- A queued message deleted just as its turn starts is skipped quietly, and the
+  next one runs. It used to report "unknown queued submission" and leave the
+  rest of the queue waiting for another turn to end. (#368)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.

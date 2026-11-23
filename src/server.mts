@@ -614,6 +614,14 @@ class QueuedSubmissionChanged extends Error {
   }
 }
 
+// A queued message was deleted after its dispatch read it. The turn's claim
+// rolls back, and the dispatch takes the next message in line instead.
+class QueuedSubmissionGone extends Error {
+  constructor(id: string) {
+    super(`unknown queued submission: ${id}`)
+  }
+}
+
 function isEmptyInput(input: UserInput[]): boolean {
   const { textPrompt, images } = extractImageInputs(input)
   return !textPrompt.trim() && images.length === 0 && !textFromInput(input).trim()
@@ -3143,7 +3151,7 @@ export class CodexClaudeAppServer {
       )
     const id = stringOr(params.queuedSubmissionId, '')
     const submission = this.queuedSubmission(threadId, id)
-    return this.dispatchQueued(peer, threadId, submission)
+    return this.dispatchQueued(peer, threadId, submission, true)
   }
 
   // The queue holds once a turn ends interrupted, until the user starts a
@@ -3180,10 +3188,14 @@ export class CodexClaudeAppServer {
   // the queue in the turn's claim transaction, so a rejected start keeps it
   // and a crash cannot commit a claimed turn without its dequeue. It never
   // joins a running turn: that would run it and leave it queued to run again.
+  // One deleted after it was read is skipped for the next in line, without an
+  // error, and nothing runs when none is left. thread/queue/start names its
+  // message (`named`), so there it answers as for any unknown id instead.
   private async dispatchQueued(
     peer: RpcPeer,
     threadId: string,
     submission: QueuedSubmission,
+    named = false,
   ): Promise<unknown> {
     for (let current = submission; ; ) {
       try {
@@ -3199,6 +3211,13 @@ export class CodexClaudeAppServer {
         this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
         return result
       } catch (error) {
+        if (error instanceof QueuedSubmissionGone) {
+          if (named) throw invalidRequest(error.message)
+          const next = this.store.listQueue(threadId)[0]
+          if (!next) return null
+          current = next
+          continue
+        }
         if (!(error instanceof QueuedSubmissionChanged)) throw error
         current = error.current
       }
@@ -4707,7 +4726,7 @@ export class CodexClaudeAppServer {
         if (queued) {
           const items = this.store.listQueue(threadId)
           const stored = items.find((entry) => entry.id === queued.id)
-          if (!stored) throw invalidRequest(`unknown queued submission: ${queued.id}`)
+          if (!stored) throw new QueuedSubmissionGone(queued.id)
           // An edit since the dispatch read it must not run the old input.
           if (!isDeepStrictEqual(stored, queued)) throw new QueuedSubmissionChanged(stored)
           // The turn and its dequeue commit or roll back together in claimTurn.
