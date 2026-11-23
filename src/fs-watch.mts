@@ -17,7 +17,8 @@ export interface PathWatch {
 // watched through its parent directory, so the watch survives the file being
 // replaced by a rename (git's `HEAD.lock` -> `HEAD`) and fires once it appears.
 // A symlinked file is also watched where its target lives, since writes to it
-// happen there.
+// happen there. A path that becomes a directory later (.git before `git init`)
+// is then watched as one, and a directory that goes away as an entry again.
 // Throws when neither the path nor any of its ancestors can be watched.
 export function watchPath(
   path: string,
@@ -43,42 +44,86 @@ export function watchPath(
     pending.clear()
   }
 
-  if (isDirectory(path)) {
-    const watcher = watch(path, { persistent: false }, (_eventType, filename) => {
-      changed(filename ? join(path, String(filename)) : path)
-    })
+  // While `path` is a directory, the directory itself is watched (`directory`);
+  // otherwise the entry is (`entry`).
+  let directory: { id: string; close: () => void } | null = null
+  let entry: (() => void) | null = null
+  let closed = false
+  // Watches `path` as what it is now. As Codex does, this runs again on every
+  // event, so the watch moves onto a directory that appears at `path` (`.git`
+  // before `git init`) or replaces the one watched, and back to the entry
+  // watch when it goes away. The new watch starts before the old one closes.
+  // Throws only when the first watch cannot start; a later move that fails
+  // keeps the current watch.
+  const settle = (): void => {
+    if (closed) return
+    const stats = directoryStats(path)
+    if (!stats) {
+      if (entry) return
+      entry = watchFile()
+      if (directory) {
+        directory.close()
+        directory = null
+        changed(path)
+      }
+      // A directory created before the entry watch started sends it nothing.
+      if (directoryStats(path)) settle()
+      return
+    }
+    const id = folderId(stats)
+    if (directory?.id === id) return
+    let watcher: FSWatcher
+    try {
+      watcher = watch(path, { persistent: false }, (_eventType, filename) => {
+        settle()
+        changed(filename ? join(path, String(filename)) : path)
+      })
+    } catch (error) {
+      if (!directory && !entry) throw error
+      debugLog('fs_watch_error', { path, error: String(error) })
+      return
+    }
     logErrors(watcher, path)
-    return {
-      close: () => {
-        watcher.close()
-        stopTimer()
-      },
+    directory?.close()
+    directory = { id, close: () => watcher.close() }
+    entry?.()
+    entry = null
+  }
+
+  // Watches the entry at `path` through its folder, and a symlink's target.
+  const watchFile = (): (() => void) => {
+    // The link's target, looked up again whenever the link itself changes.
+    let target: { path: string; close: () => void } | null = null
+    const followLink = (): void => {
+      const real = symlinkTarget(path)
+      if (real === (target?.path ?? null)) return
+      target?.close()
+      target = null
+      if (real === null) return
+      try {
+        target = { path: real, close: watchEntry(real, () => changed(path)) }
+      } catch (error) {
+        debugLog('fs_watch_error', { path: real, error: String(error) })
+      }
+    }
+    const closeEntry = watchEntry(path, () => {
+      followLink()
+      settle()
+      changed(path)
+    })
+    followLink()
+    return () => {
+      closeEntry()
+      target?.close()
     }
   }
 
-  // The link's target, looked up again whenever the link itself changes.
-  let target: { path: string; close: () => void } | null = null
-  const followLink = (): void => {
-    const real = symlinkTarget(path)
-    if (real === (target?.path ?? null)) return
-    target?.close()
-    target = null
-    if (real === null) return
-    try {
-      target = { path: real, close: watchEntry(real, () => changed(path)) }
-    } catch (error) {
-      debugLog('fs_watch_error', { path: real, error: String(error) })
-    }
-  }
-  const closeEntry = watchEntry(path, () => {
-    followLink()
-    changed(path)
-  })
-  followLink()
+  settle()
   return {
     close: () => {
-      closeEntry()
-      target?.close()
+      closed = true
+      directory?.close()
+      entry?.()
       stopTimer()
     },
   }
@@ -181,9 +226,13 @@ interface Folder {
 function nearestFolder(path: string): Folder {
   for (let dir = path; ; dir = dirname(dir)) {
     const stats = directoryStats(dir)
-    if (stats) return { path: dir, id: `${stats.dev}:${stats.ino}:${stats.birthtimeMs}` }
+    if (stats) return { path: dir, id: folderId(stats) }
     if (dirname(dir) === dir) return { path: dir, id: '' }
   }
+}
+
+function folderId(stats: Stats): string {
+  return `${stats.dev}:${stats.ino}:${stats.birthtimeMs}`
 }
 
 // What tells a change of the entry at `path`; '' while it is missing. The
@@ -196,10 +245,6 @@ function entryStamp(path: string): string {
   } catch {
     return ''
   }
-}
-
-function isDirectory(path: string): boolean {
-  return directoryStats(path) !== undefined
 }
 
 // Runs on every event, so a missing folder is not an exception.

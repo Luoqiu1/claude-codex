@@ -484,6 +484,78 @@ test('a watched directory reports the changed entry under the requested path', a
   })
 })
 
+test('a watch on a missing folder moves onto it once it appears, leaking no watches', async (t) => {
+  const spy = spyOnWatch(t)
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const project = tempRoot()
+    const git = join(project, '.git')
+    assert.deepEqual(await app.request('fs/watch', { watchId: 'git', path: git }), { path: git })
+    assert.deepEqual(spy.paths, [project])
+
+    // `git init` (fs/watch on .git before it): touch .git until the watch sees it.
+    const init = await probeChange(app, 'git', (attempt) => {
+      if (attempt > 0) {
+        utimesSync(git, new Date(), new Date())
+      } else {
+        mkdirSync(git)
+        writeFileSync(join(git, 'HEAD'), 'ref: refs/heads/main\n')
+      }
+    })
+    assert.ok(init.includes(git), JSON.stringify(init))
+    // Entries of the new folder are reported, as by a watch started on it.
+    const origHead = join(git, 'ORIG_HEAD')
+    const update = await probeChange(app, 'git', (attempt) =>
+      writeFileSync(origHead, `abc ${attempt}\n`),
+    )
+    assert.ok(update.includes(origHead), JSON.stringify(update))
+    // The watch moved onto the folder, the only watch left open.
+    assert.deepEqual(spy.paths.slice(-1), [git])
+    await openWatches(spy, 1)
+    await app.request('fs/unwatch', { watchId: 'git' })
+    await openWatches(spy, 0)
+  })
+})
+
+test('a watched folder that is deleted and created again keeps reporting its entries', async (t) => {
+  const spy = spyOnWatch(t)
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const git = gitDir()
+    const project = dirname(git)
+    const origHead = join(git, 'ORIG_HEAD')
+    await watchLive(app, 'git', git, join(git, '.probe'))
+    assert.deepEqual(spy.paths, [git])
+
+    for (const round of [1, 2, 3]) {
+      // `rm -rf .git`: the folder itself is reported gone.
+      const gone = await probeChange(app, 'git', (attempt) => {
+        if (attempt === 0) rmSync(git, { recursive: true })
+      })
+      assert.ok(gone.includes(git), JSON.stringify(gone))
+      // `git init`: touch .git until the watch sees it.
+      const init = await probeChange(app, 'git', (attempt) => {
+        if (attempt > 0) {
+          utimesSync(git, new Date(), new Date())
+        } else {
+          mkdirSync(git)
+          writeFileSync(join(git, 'HEAD'), 'ref: refs/heads/main\n')
+        }
+      })
+      assert.ok(init.includes(git), JSON.stringify(init))
+      // The watch moved up to the project folder and onto the new .git. On
+      // Linux a watch stays with the folder it started on, so one left on the
+      // deleted .git would report nothing more.
+      assert.deepEqual(spy.paths.slice(-2), [project, git])
+      const update = await probeChange(app, 'git', (attempt) =>
+        writeFileSync(origHead, `round ${round} ${attempt}\n`),
+      )
+      assert.ok(update.includes(origHead), JSON.stringify(update))
+      await openWatches(spy, 1)
+    }
+    await app.request('fs/unwatch', { watchId: 'git' })
+    await openWatches(spy, 0)
+  })
+})
+
 test('bursts of events for one watch arrive as one fs/changed', async () => {
   await withInProcessApp(new MockRuntime(), async (app) => {
     const head = join(gitDir(), 'HEAD')
