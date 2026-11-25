@@ -1048,6 +1048,10 @@ export class CodexClaudeAppServer {
     this.stopped = true
     for (const search of this.activeThreadSearches.values()) search.cancelled = true
     this.activeThreadSearches.clear()
+    // A follow-up retry still pending would find the server stopped; until
+    // it fired, it would keep hasActiveTurns() true.
+    for (const timer of this.followUpRetries.values()) clearTimeout(timer)
+    this.followUpRetries.clear()
     const nativeStopped = this.codexBridge?.stop()
     // command/exec and process/spawn run in process groups of their own, out
     // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
