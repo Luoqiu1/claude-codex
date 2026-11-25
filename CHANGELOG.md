@@ -468,6 +468,11 @@ versioning or publishing metadata.
   to stop for good. A folder created while the watch moves down to it is no
   longer missed, and on macOS a watch whose nearest existing folder is `/`
   now sees its entry. (#348)
+- `fs/watch` on a folder that does not exist yet (`.git` before `git init`)
+  moves onto the folder once it appears and reports the changes inside it, as
+  Codex does; it used to report the folder appearing once and then nothing.
+  A watched folder that is deleted moves back to watching its path, and one
+  created again in its place is watched anew. (#369)
 - `fs/readDirectory` lists a symlink as the file or folder it points to, as
   `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
   such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
