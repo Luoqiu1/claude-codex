@@ -279,6 +279,7 @@ import { TurnWatchdog } from './turn-watchdog.mjs'
 import type {
   ClaudeResumePoint,
   ClaudeRuntime,
+  ClaudeSessionRef,
   CommandAction,
   DynamicToolCallRequest,
   DynamicToolCallResponse,
@@ -5194,14 +5195,8 @@ export class CodexClaudeAppServer {
       resolvedEffort,
     })
     // A fork resumes the session it was forked from as a fork of it until a
-    // turn of its own has written to a session. Counting turns instead would
-    // resume the parent's session itself after a first turn that failed
-    // before Claude started. A fork whose own turns left no checkpoints (one
-    // from before checkpoints) forks its own session once more, then has one.
-    const forkSession =
-      thread.forkedFromId != null &&
-      thread.claudeSessionId != null &&
-      !this.store.turnsWroteSession(thread.id, thread.claudeSessionId)
+    // turn of its own has written to a session.
+    const forkSession = this.forkOnParentSession(thread)
     // Set after a rewind or fork: this turn resumes the session only up to a
     // checkpoint. It stays pending until Claude starts the forked session.
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
@@ -10663,6 +10658,9 @@ export class CodexClaudeAppServer {
       recencyAt: thread.updatedAt,
       status: thread.status,
       path: null,
+      // Where a Claude thread's transcript is, for clients on the same
+      // computer that also read Claude Code's.
+      claudeSession: this.claudeSessionOf(thread),
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
       canAcceptDirectInput: true,
@@ -10682,6 +10680,37 @@ export class CodexClaudeAppServer {
       projectId: thread.projectId ?? null,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
+  }
+
+  // The Claude Code session the thread's own turns write, and where the
+  // backend keeps its transcript. Null for a Codex thread, before the first
+  // Claude turn, for a fork still on its parent's session (that transcript is
+  // the parent's), and for a session the backend keeps no transcript of.
+  private claudeSessionOf(thread: ThreadRecord): ClaudeSessionRef | null {
+    const id = thread.claudeSessionId
+    if (thread.runtimeBackend !== 'claude' || !id || this.forkOnParentSession(thread)) return null
+    const cwd = thread.claudeSessionCwd ?? thread.cwd
+    const transcript = this.runtime.sessionTranscript?.({
+      sessionId: id,
+      model: thread.model,
+      modelProfileFingerprint: thread.modelProfileFingerprint ?? null,
+      cwd,
+    })
+    return transcript ? { id, cwd, configDir: transcript.configDir } : null
+  }
+
+  // True while a fork's stored session is the one it was forked from: until
+  // a turn of its own has written to a session, its turns resume that one as
+  // a fork of it. Counting turns instead would resume the parent's session
+  // itself after a first turn that failed before Claude started. A fork
+  // whose own turns left no checkpoints (one from before checkpoints) forks
+  // its own session once more, then has one.
+  private forkOnParentSession(thread: ThreadRecord): boolean {
+    return (
+      thread.forkedFromId != null &&
+      thread.claudeSessionId != null &&
+      !this.store.turnsWroteSession(thread.id, thread.claudeSessionId)
+    )
   }
 
   private subagentDepth(thread: ThreadRecord): number {

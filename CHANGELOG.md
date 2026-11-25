@@ -270,6 +270,14 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Every Thread now carries `claudeSession`: the Claude Code session a Claude
+  thread's turns resume (`id`), the folder it was last written in (`cwd`) and
+  the config directory it lives under (`configDir`), a model process
+  profile's own included. A client on the same computer that also lists Claude
+  Code transcripts can match a thread to its transcript instead of showing the
+  conversation twice. It is null for Codex threads, before the first Claude
+  turn, and for a fork until a turn of its own has written a session; the
+  thread's `path` stays null. (#357)
 - `thread/loaded/list` no longer keeps every subagent and helper thread a
   client ever followed. A subagent thread is loaded while its agent runs and
   unloads when the agent is done, and an ephemeral thread unloads once its
