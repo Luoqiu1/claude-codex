@@ -1140,6 +1140,18 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- The App's helper requests leave no Claude Code transcripts. A title, a
+  description fork and the other turns of an ephemeral thread, and the summary
+  a compaction falls back to, run with the Agent SDK's `persistSession: false`.
+  Each used to write a transcript under the config directory, which tools that
+  list Claude Code sessions showed as one of the user's. A description fork
+  still starts from the chat's session. A subagent thread, which the user can
+  go on talking to, keeps its transcripts. Nothing could resume such a
+  session, so the thread does not record it: each turn of an ephemeral fork
+  starts from its parent's session again, and a later turn of any other
+  ephemeral thread starts from no session. An ephemeral thread other than a
+  subagent's therefore carries context from one turn to the next only while
+  their Claude session is still open. (#358)
 - `runs.jsonl`, the run registry, rotates like `debug.jsonl`: at
   `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
   `runs.jsonl.1`, and `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default)

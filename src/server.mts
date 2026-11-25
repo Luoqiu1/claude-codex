@@ -172,6 +172,7 @@ import {
   fileChangeFromTool,
   gitDiff,
   hasLegacyPermissionParams,
+  helperThread,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -4390,20 +4391,25 @@ export class CodexClaudeAppServer {
     }
     let compacted = false
     let failure: string | null = null
+    // A helper thread's session leaves no transcript to resume: the thread
+    // goes on naming the session it resumed, as after its user turns.
+    const keepsSession = context.persistSession !== false
     await this.runtime
       .runTurn(context, {
         onEvent: async (event) => {
           // As in a user turn, where Claude's session ends up is where a
           // rewind to this turn resumes.
           if (event.type === 'checkpoint') {
-            this.store.setTurnCheckpoint(turnId, {
-              sessionId: event.claudeSessionId,
-              messageUuid: event.messageUuid,
-            })
+            if (keepsSession)
+              this.store.setTurnCheckpoint(turnId, {
+                sessionId: event.claudeSessionId,
+                messageUuid: event.messageUuid,
+              })
             return
           }
           if (!active()) return
           if (event.type === 'session') {
+            if (!keepsSession) return
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
             return
@@ -4424,7 +4430,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'completed') {
-            if (event.claudeSessionId)
+            if (keepsSession && event.claudeSessionId)
               this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
             return
@@ -4502,6 +4508,8 @@ export class CodexClaudeAppServer {
         effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
         claudeSessionId: null,
         forkSession: false,
+        // Nothing resumes this session: it leaves no transcript.
+        persistSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
         // With web search off, the summary cannot search either.
@@ -5239,6 +5247,7 @@ export class CodexClaudeAppServer {
       // parent is older than the second after it.
       forkedAt:
         !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
+      ...(!isCodexThread && helperThread(thread) ? { persistSession: false } : {}),
       mcpServers: mcp.sdkValue,
       allowedTools: defaultAllowedTools(),
       inheritedAllowedTools: permissionRules?.allow ?? null,
@@ -5755,6 +5764,12 @@ export class CodexClaudeAppServer {
             message: `${toolName} was denied because the turn it asked for approval in had ended; the user can re-run it in a turn.`,
           }
     let resumedAtCheckpoint = false
+    // A helper thread's turn writes no transcript, so neither its session nor
+    // its checkpoints are recorded: nothing could resume them. The thread
+    // goes on naming the session it resumed, and its next turn starts from
+    // there again: an ephemeral fork from its parent's session, at the same
+    // point; any other helper thread from no session.
+    const keepsSession = context.persistSession !== false
     const runtimeTurn = this.runtime.runTurn(
       context,
       // What Claude streams, and the approvals and answers it waits on.
@@ -5767,10 +5782,11 @@ export class CodexClaudeAppServer {
           // Checkpoints are the exception: whatever Claude wrote last, even
           // after an interrupt, is where a rewind to this turn must resume.
           if (event.type === 'checkpoint') {
-            this.store.setTurnCheckpoint(turn.id, {
-              sessionId: event.claudeSessionId,
-              messageUuid: event.messageUuid,
-            })
+            if (keepsSession)
+              this.store.setTurnCheckpoint(turn.id, {
+                sessionId: event.claudeSessionId,
+                messageUuid: event.messageUuid,
+              })
             return
           }
           if (!turnIsActive()) return
@@ -5789,11 +5805,10 @@ export class CodexClaudeAppServer {
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
+            if (resumeSessionAt) resumedAtCheckpoint = true
+            if (!keepsSession) return
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
-            if (resumeSessionAt) {
-              this.store.clearClaudeResumeAt(thread.id)
-              resumedAtCheckpoint = true
-            }
+            if (resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
             return
           }
           if (activeSubagents.size > 0 && !this.runtime.filtersNestedEvents?.(thread.id)) {
@@ -6737,7 +6752,7 @@ export class CodexClaudeAppServer {
               // next turn). Claude threads keep the original wiring.
               if (isCodexThread) {
                 this.store.updateCodexSessionId(thread.id, event.claudeSessionId)
-              } else {
+              } else if (keepsSession) {
                 this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
               }
             }
