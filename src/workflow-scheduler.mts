@@ -11,6 +11,14 @@ export interface WorkflowSchedulerOptions {
   readonly leaseTtlMs: number
 }
 
+// The claim `schedule` handed a worker: its lease's worker id and the task's
+// attempt count at that point. The attempt tells a worker's own later reclaim
+// of the same task apart from the claim it lost.
+export interface WorkflowClaim {
+  readonly workerId: string
+  readonly attempt?: number | undefined
+}
+
 export type WorkflowScheduleDecision =
   | { readonly type: 'claimed'; readonly task: WorkflowTask; readonly state: WorkflowState }
   | { readonly type: 'idle'; readonly reason: 'no-runnable-task'; readonly state: WorkflowState }
@@ -39,6 +47,20 @@ export class WorkflowTaskNotFoundError extends Error {
   }
 }
 
+export class WorkflowClaimError extends Error {
+  override readonly name = 'WorkflowClaimError'
+  readonly taskId: string
+  readonly claim: WorkflowClaim
+
+  constructor(task: WorkflowTask, claim: WorkflowClaim) {
+    super(
+      `workflow task ${task.id} is no longer claimed by ${describeClaim(claim)}; ${describeHolder(task)}`,
+    )
+    this.taskId = task.id
+    this.claim = claim
+  }
+}
+
 export function scheduleNextWorkflowTask(
   state: WorkflowState,
   options: WorkflowSchedulerOptions,
@@ -54,9 +76,10 @@ export function renewWorkflowLease(
   state: WorkflowState,
   taskId: string,
   options: WorkflowSchedulerOptions,
+  attempt?: number,
 ): WorkflowState {
   const task = requireTask(state, taskId)
-  if (task.status !== 'running' || task.lease?.workerId !== options.workerId) return state
+  if (!holdsClaim(task, { workerId: options.workerId, attempt })) return state
   return replaceTask(state, {
     ...task,
     updatedAt: options.now.toISOString(),
@@ -64,12 +87,16 @@ export function renewWorkflowLease(
   })
 }
 
+// With a claim, complete, fail and block refuse a task that claim no longer
+// holds, such as one another worker reclaimed after its lease expired. Without
+// one they apply to whatever attempt holds the task, for manual repair.
 export function completeWorkflowTask(
   state: WorkflowState,
   taskId: string,
   at: Date,
+  claim?: WorkflowClaim,
 ): WorkflowState {
-  return replaceTask(state, transitionTask(requireTask(state, taskId), 'done', at))
+  return replaceTask(state, transitionTask(claimedTask(state, taskId, claim), 'done', at))
 }
 
 export function failWorkflowTask(
@@ -77,8 +104,9 @@ export function failWorkflowTask(
   taskId: string,
   errorMessage: string,
   at: Date,
+  claim?: WorkflowClaim,
 ): WorkflowState {
-  const task = requireTask(state, taskId)
+  const task = claimedTask(state, taskId, claim)
   const nextStatus = task.attempts >= task.maxAttempts ? 'failed' : 'queued'
   return replaceTask(state, {
     ...transitionTask(task, nextStatus, at),
@@ -91,9 +119,10 @@ export function blockWorkflowTask(
   taskId: string,
   reason: string,
   at: Date,
+  claim?: WorkflowClaim,
 ): WorkflowState {
   return replaceTask(state, {
-    ...transitionTask(requireTask(state, taskId), 'blocked', at),
+    ...transitionTask(claimedTask(state, taskId, claim), 'blocked', at),
     blockedReason: reason,
   })
 }
@@ -199,6 +228,37 @@ function requireTask(state: WorkflowState, taskId: string): WorkflowTask {
   const task = state.tasks.find((candidate) => candidate.id === taskId)
   if (task) return task
   throw new WorkflowTaskNotFoundError(taskId)
+}
+
+function claimedTask(
+  state: WorkflowState,
+  taskId: string,
+  claim: WorkflowClaim | undefined,
+): WorkflowTask {
+  const task = requireTask(state, taskId)
+  if (claim && !holdsClaim(task, claim)) throw new WorkflowClaimError(task, claim)
+  return task
+}
+
+// A claim whose lease expired still holds the task until another worker
+// reclaims it; `schedule` then bumps the attempt and replaces the lease.
+function holdsClaim(task: WorkflowTask, claim: WorkflowClaim): boolean {
+  return (
+    task.status === 'running' &&
+    task.lease?.workerId === claim.workerId &&
+    (claim.attempt === undefined || claim.attempt === task.attempts)
+  )
+}
+
+function describeClaim(claim: WorkflowClaim): string {
+  const attempt = claim.attempt === undefined ? '' : ` attempt ${claim.attempt}`
+  return `worker ${claim.workerId}${attempt}`
+}
+
+function describeHolder(task: WorkflowTask): string {
+  if (task.status !== 'running') return `it is ${task.status}`
+  if (!task.lease) return `attempt ${task.attempts} is running without a lease`
+  return `attempt ${task.attempts} is running for worker ${task.lease.workerId}`
 }
 
 function assertNever(value: never): never {

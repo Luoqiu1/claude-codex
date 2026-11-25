@@ -572,9 +572,13 @@ npm run workflow -- status
 npm run workflow -- health
 npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
 npm run workflow -- schedule --worker codex-heartbeat
-npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
-npm run workflow -- complete --task task-id
+npm run workflow -- heartbeat --task task-id --worker codex-heartbeat --attempt 1
+npm run workflow -- complete --task task-id --worker codex-heartbeat --attempt 1
 ```
+
+`--worker` and `--attempt` name the claim `schedule` printed (`task.lease.workerId`
+and `task.attempts`). `complete`, `fail` and `block` refuse a task another claim
+has since taken and exit 1 without changing it.
 
 Use `health` from recurring heartbeats before doing more work. A healthy loop
 has no stale leases, no failed tasks, and either no running task or one running

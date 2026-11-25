@@ -37,7 +37,7 @@ If `health.status` is `healthy` and a task is running with an active lease,
 continue that task. Renew the lease only when the worker needs more time:
 
 ```bash
-npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
+npm run workflow -- heartbeat --task task-id --worker codex-heartbeat --attempt 1
 ```
 
 If no task is running and there is one clear safe task, queue exactly one task
@@ -48,20 +48,37 @@ npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
 npm run workflow -- schedule --worker codex-heartbeat
 ```
 
+The claim is the worker id and the attempt `schedule` printed:
+`task.lease.workerId` and `task.attempts`. Pass both to every later command for
+that task, so a result that arrives after the lease expired and the task was
+claimed again cannot change the newer attempt. The examples here use attempt 1.
+
 Finish by running the matching verification commands, then mark the task
 complete:
 
 ```bash
-npm run workflow -- complete --task task-id
+npm run workflow -- complete --task task-id --worker codex-heartbeat --attempt 1
 ```
 
 Use `fail` for a task that should retry or fail closed. Use `block` when the
 worker cannot proceed without user input or an external state change:
 
 ```bash
-npm run workflow -- fail --task task-id --error "Verification failed"
-npm run workflow -- block --task task-id --reason "Needs a missing credential"
+npm run workflow -- fail --task task-id --worker codex-heartbeat --attempt 1 --error "Verification failed"
+npm run workflow -- block --task task-id --worker codex-heartbeat --attempt 1 --reason "Needs a missing credential"
 ```
+
+`complete`, `fail` and `block` refuse a task the claim no longer holds: another
+worker, or the same worker on a later attempt, reclaimed it, or it already
+finished. They print `workflow task task-id is no longer claimed by ...` with
+the task's current holder or status, exit 1, and leave the task unchanged.
+`heartbeat` leaves such a task alone. A claim whose lease expired still holds
+the task until `schedule` reclaims it. `--worker` alone checks only the worker
+id, which cannot tell a worker's own later attempt from the one it lost.
+
+Without `--worker`, `complete`, `fail` and `block` apply to whichever attempt
+holds the task. Keep that form for manual repair by an operator, not for
+workers.
 
 A value that starts with `--`, such as a diff or a CLI error line, needs the
 `--name=value` form (`--error="--- a/x ..."`); given as a separate argument it
@@ -83,7 +100,9 @@ A safe heartbeat has no stale leases, no failed tasks, and no duplicate queued
 work. `schedule` reclaims a stale lease. If that lease was the task's final
 attempt (`attempts >= maxAttempts`), `schedule` marks the task `failed` with a
 lease-expiry `lastError` instead, and a late `complete` or `fail` from that
-worker is rejected. An active lease should not be stolen.
+worker is rejected. When `schedule` reclaims an earlier attempt, a late
+`complete`, `fail` or `block` that names the old claim is rejected too. An
+active lease should not be stolen.
 
 ## Run registry
 
