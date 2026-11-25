@@ -556,6 +556,43 @@ test('a watched folder that is deleted and created again keeps reporting its ent
   })
 })
 
+test('a watched folder whose entry watch fails to start once deleted keeps the adapter up', async (t) => {
+  const git = gitDir()
+  const project = dirname(git)
+  // Once .git is deleted, the watch on its parent that takes over fails to
+  // start (out of watches), as fs.watch throws then.
+  let failing = false
+  const spy = spyOnWatch(t, (path, listener, start) => {
+    if (failing && path === project) {
+      failing = false
+      throw Object.assign(new Error(`EMFILE: too many open files, watch '${path}'`), {
+        code: 'EMFILE',
+      })
+    }
+    return start(listener)
+  })
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    await watchLive(app, 'git', git, join(git, '.probe'))
+    assert.deepEqual(spy.paths, [git])
+
+    // `rm -rf .git`: the move to the entry watch fails inside the watch's
+    // listener. An exception escaping it would end the process (and fail
+    // this test as an uncaught exception).
+    failing = true
+    rmSync(git, { recursive: true })
+    await poll('the move to the entry watch', () => (failing ? undefined : true))
+    await delay(300) // let the listener return and the debounce window close
+
+    // The adapter still serves requests, and a new watch works.
+    const other = join(tempRoot(), 'HEAD')
+    await watchLive(app, 'other', other, other)
+    await app.request('fs/unwatch', { watchId: 'other' })
+    // Unwatching closes what the failed move left open.
+    await app.request('fs/unwatch', { watchId: 'git' })
+    await openWatches(spy, 0)
+  })
+})
+
 test('bursts of events for one watch arrive as one fs/changed', async () => {
   await withInProcessApp(new MockRuntime(), async (app) => {
     const head = join(gitDir(), 'HEAD')

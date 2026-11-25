@@ -60,7 +60,15 @@ export function watchPath(
     const stats = directoryStats(path)
     if (!stats) {
       if (entry) return
-      entry = watchFile()
+      try {
+        entry = watchFile()
+      } catch (error) {
+        // Runs in the directory watch's listener here, where an exception
+        // would end the adapter.
+        if (!directory) throw error
+        debugLog('fs_watch_error', { path, error: String(error) })
+        return
+      }
       if (directory) {
         directory.close()
         directory = null
